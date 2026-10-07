@@ -1,0 +1,18 @@
+{
+  "name": "xon-relayer",
+  "version": "1.0.0",
+  "description": "Standalone relayer service that pays out XON on Xode for USDT received on Xode itself, AssetHub, or Ethereum.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test:e2e": "node test/e2e.manual.js"
+  },
+  "dependencies": {
+    "@polkadot/api": "^16.5.1",
+    "@polkadot/keyring": "^14.0.3",
+    "@polkadot/util-crypto": "^14.0.3",
+    "dotenv": "^17.2.3",
+    "ethers": "^6.15.0"
+  }
+}

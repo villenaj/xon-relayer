@@ -1,0 +1,6 @@
+[
+  "function usdt() view returns (address)",
+  "function deposit(uint256 usdtAmount, address xodeBeneficiary)",
+  "function depositNonce() view returns (uint256)",
+  "event Deposited(address indexed depositor, address indexed xodeBeneficiary, uint256 usdtAmount, uint256 indexed depositNonce)"
+]

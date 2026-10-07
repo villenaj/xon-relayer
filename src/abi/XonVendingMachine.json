@@ -1,0 +1,23 @@
+[
+  "function usdt() view returns (address)",
+  "function relayer() view returns (address)",
+  "function quote(uint256 usdtAmount) view returns (uint256)",
+  "function settledDeposits(bytes32) view returns (bool)",
+  "function externalSettledDeposits(bytes32) view returns (bool)",
+  "function settlePurchase(address buyer, uint256 usdtAmount, bytes32 depositTxHash)",
+  "function settleExternalPurchase(address buyer, uint256 usdtAmount, string sourceChain, bytes32 depositId)",
+  "event Settled(address indexed buyer, bytes32 indexed depositTxHash, uint256 usdtIn, uint256 xonOut)",
+  "event ExternalSettled(address indexed buyer, string sourceChain, bytes32 indexed depositId, uint256 usdtIn, uint256 xonOut)",
+  "error NotOwner()",
+  "error NotRelayer()",
+  "error IsPaused()",
+  "error ZeroAddress()",
+  "error ZeroAmount()",
+  "error InsufficientReserve()",
+  "error UsdtTransferFailed()",
+  "error XonTransferFailed()",
+  "error Reentrant()",
+  "error AlreadySettled()",
+  "error UnverifiedDeposit()",
+  "error AlreadyExternallySettled()"
+]
