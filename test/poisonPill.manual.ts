@@ -3,9 +3,9 @@
 // must not block a legitimate deposit that arrives right after it. Before the fix, one bad
 // transfer like this would freeze the whole adapter forever.
 //
-// Needs the same local infra as test/e2e.manual.js (zombienet + eth-rpc), Xode only for this one.
+// Needs the same local infra as test/e2e.manual.ts (zombienet + eth-rpc), Xode only for this one.
 //
-// Usage: node test/poisonPill.manual.js
+// Usage: npx tsx test/poisonPill.manual.ts
 
 import { ApiPromise, WsProvider } from "@polkadot/api";
 import { Keyring } from "@polkadot/keyring";
@@ -13,16 +13,26 @@ import { cryptoWaitReady, encodeAddress } from "@polkadot/util-crypto";
 import { ethers } from "ethers";
 import { readFileSync, rmSync } from "node:fs";
 import { spawn } from "node:child_process";
+import type { SubmittableExtrinsic } from "@polkadot/api/types";
+import type { KeyringPair } from "@polkadot/keyring/types";
 
 const XODE_WS = "ws://127.0.0.1:9977";
 const XODE_ETH_RPC = "http://127.0.0.1:8545";
 const UNIT = 1_000_000_000_000n;
 const USDT_DECIMALS = 6;
 
-const VendingArtifact = JSON.parse(readFileSync("/home/jowel/Documents/GitHub/villenaj/xode-blockchain/contracts/out/XonVendingMachine.sol/XonVendingMachine.json"));
+interface ForgeArtifact {
+  abi: ethers.InterfaceAbi;
+  bytecode: { object: string };
+}
+function loadArtifact(file: string): ForgeArtifact {
+  return JSON.parse(readFileSync(file, "utf8")) as ForgeArtifact;
+}
 
-function submit(api, tx, signer) {
-  return new Promise((resolve, reject) => {
+const VendingArtifact = loadArtifact("/home/jowel/Documents/GitHub/villenaj/xode-blockchain/contracts/out/XonVendingMachine.sol/XonVendingMachine.json");
+
+function submit(api: ApiPromise, tx: SubmittableExtrinsic<"promise">, signer: KeyringPair): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
     tx.signAndSend(signer, (r) => {
       if (r.dispatchError) {
         const msg = r.dispatchError.isModule ? api.registry.findMetaError(r.dispatchError.asModule).name : r.dispatchError.toString();
@@ -33,20 +43,20 @@ function submit(api, tx, signer) {
     }).catch(reject);
   });
 }
-function fallbackSs58(addr) {
+function fallbackSs58(addr: string): string {
   const raw = new Uint8Array(32);
   raw.set(ethers.getBytes(addr), 0);
   raw.fill(0xee, 20);
   return encodeAddress(raw, 42);
 }
-function precompileAddr(assetId) {
+function precompileAddr(assetId: number): string {
   const bytes = new Uint8Array(20);
   new DataView(bytes.buffer).setUint32(0, assetId, false);
   bytes[16] = 0x01; bytes[17] = 0x20;
   return ethers.getAddress(ethers.hexlify(bytes));
 }
 
-async function main() {
+async function main(): Promise<void> {
   await cryptoWaitReady();
   const keyring = new Keyring({ type: "sr25519" });
   const alice = keyring.addFromUri("//Alice");
@@ -74,7 +84,7 @@ async function main() {
   const usdtAddress = precompileAddr(assetId);
 
   const factory = new ethers.ContractFactory(VendingArtifact.abi, VendingArtifact.bytecode.object, deployer);
-  const vending = await factory.deploy(usdtAddress, owner.address, ethers.parseEther("5"), relayer.address);
+  const vending = (await factory.deploy(usdtAddress, owner.address, ethers.parseEther("5"), relayer.address)) as unknown as ethers.Contract;
   await vending.waitForDeployment();
   const vendingAddress = await vending.getAddress();
   console.log("vending:", vendingAddress);
@@ -96,7 +106,7 @@ async function main() {
   console.log("legitimate deposit tx:", goodReceipt.hash);
 
   rmSync("/home/jowel/Documents/GitHub/villenaj/xon-relayer/.checkpoints", { recursive: true, force: true });
-  const relayerProc = spawn(process.execPath, ["src/index.js"], {
+  const relayerProc = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
     cwd: "/home/jowel/Documents/GitHub/villenaj/xon-relayer",
     env: {
       ...process.env,
@@ -106,8 +116,8 @@ async function main() {
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  relayerProc.stdout.on("data", (d) => process.stdout.write(`[relayer] ${d}`));
-  relayerProc.stderr.on("data", (d) => process.stderr.write(`[relayer] ${d}`));
+  relayerProc.stdout.on("data", (d: Buffer) => process.stdout.write(`[relayer] ${d}`));
+  relayerProc.stderr.on("data", (d: Buffer) => process.stderr.write(`[relayer] ${d}`));
 
   try {
     console.log("\n=== Waiting for the legitimate deposit to settle despite the poison pill in front of it ===");
@@ -131,4 +141,4 @@ async function main() {
   }
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+main().catch((e: unknown) => { console.error(e); process.exit(1); });

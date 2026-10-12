@@ -8,7 +8,7 @@ Type=simple
 User=xonrelayer
 WorkingDirectory=/opt/xon-relayer
 EnvironmentFile=/etc/xon-relayer.env
-ExecStart=/usr/bin/node src/index.js
+ExecStart=/usr/bin/node dist/index.js
 Restart=always
 RestartSec=5
 

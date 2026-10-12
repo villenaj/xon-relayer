@@ -23,8 +23,8 @@ gateway contract's owner key that can withdraw its custodied USDT) is the actual
 for those two paths - see the contract-level comments in `XonVendingMachine.sol` and
 `EthUsdtGateway.sol` in the `xode-blockchain` repo.
 
-Both the Ethereum and AssetHub legs are really the same adapter (`src/adapters/evmGatewayAdapter.js`)
-called with different chain config - `ethereumAdapter.js` and `assetHubAdapter.js` are thin wrappers
+Both the Ethereum and AssetHub legs are really the same adapter (`src/adapters/evmGatewayAdapter.ts`)
+called with different chain config - `ethereumAdapter.ts` and `assetHubAdapter.ts` are thin wrappers
 around it.
 
 ## Setup
@@ -32,8 +32,13 @@ around it.
 ```bash
 npm install
 cp .env.example .env   # fill in the values for your deployment
-node src/index.js
+npm run build          # compiles src/ to dist/
+npm start              # node dist/index.js
 ```
+
+For development, `npm run dev` runs `src/index.ts` directly via `tsx` (no build step), and
+`npm run typecheck` type-checks both `src/` and `test/`. The manual tests run with
+`npm run test:e2e`, `npm run test:multi-buyer` and `npm run test:poison-pill`.
 
 Each of the three adapters can be toggled independently via `ENABLE_XODE_ADAPTER` /
 `ENABLE_ASSETHUB_ADAPTER` / `ENABLE_ETHEREUM_ADAPTER` in `.env` - run only what you need.
@@ -52,3 +57,4 @@ See `systemd/xon-relayer.service` for an example unit file. Key points:
   account (`chmod 600`, owned by that user) - never inline in the unit file or command line.
 - Run under a dedicated, no-login service user.
 - `CHECKPOINT_DIR` should point somewhere persistent and writable by that user.
+- The unit runs the compiled `dist/index.js`, so run `npm run build` as part of each deploy.

@@ -15,7 +15,7 @@
 //   - `forge build` run in xode-blockchain/contracts, so the compiled artifacts this script reads
 //     (XonVendingMachine, EthUsdtGateway, MockUSDT) exist
 //
-// Usage: node test/e2e.manual.js
+// Usage: npx tsx test/e2e.manual.ts
 
 import { ApiPromise, WsProvider } from "@polkadot/api";
 import { Keyring } from "@polkadot/keyring";
@@ -23,6 +23,8 @@ import { cryptoWaitReady, encodeAddress } from "@polkadot/util-crypto";
 import { ethers } from "ethers";
 import { readFileSync, rmSync } from "node:fs";
 import { spawn } from "node:child_process";
+import type { SubmittableExtrinsic } from "@polkadot/api/types";
+import type { KeyringPair } from "@polkadot/keyring/types";
 import { externalDepositId } from "../src/settlement.js";
 
 const XODE_WS = "ws://127.0.0.1:9977";
@@ -33,14 +35,22 @@ const ANVIL_RPC = "http://127.0.0.1:8546";
 const UNIT = 1_000_000_000_000n;
 const USDT_DECIMALS = 6;
 
-const VendingArtifact = JSON.parse(readFileSync("/home/jowel/Documents/GitHub/villenaj/xode-blockchain/contracts/out/XonVendingMachine.sol/XonVendingMachine.json"));
-const GatewayArtifact = JSON.parse(readFileSync("/home/jowel/Documents/GitHub/villenaj/xode-blockchain/contracts/out/EthUsdtGateway.sol/EthUsdtGateway.json"));
-const MockUsdtArtifact = JSON.parse(readFileSync("/home/jowel/Documents/GitHub/villenaj/xode-blockchain/contracts/out/MockUSDT.sol/MockUSDT.json"));
+interface ForgeArtifact {
+  abi: ethers.InterfaceAbi;
+  bytecode: { object: string };
+}
+function loadArtifact(file: string): ForgeArtifact {
+  return JSON.parse(readFileSync(file, "utf8")) as ForgeArtifact;
+}
+
+const VendingArtifact = loadArtifact("/home/jowel/Documents/GitHub/villenaj/xode-blockchain/contracts/out/XonVendingMachine.sol/XonVendingMachine.json");
+const GatewayArtifact = loadArtifact("/home/jowel/Documents/GitHub/villenaj/xode-blockchain/contracts/out/EthUsdtGateway.sol/EthUsdtGateway.json");
+const MockUsdtArtifact = loadArtifact("/home/jowel/Documents/GitHub/villenaj/xode-blockchain/contracts/out/MockUSDT.sol/MockUSDT.json");
 
 const ANVIL_DEFAULT_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
-function submit(api, tx, signer) {
-  return new Promise((resolve, reject) => {
+function submit(api: ApiPromise, tx: SubmittableExtrinsic<"promise">, signer: KeyringPair): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
     tx.signAndSend(signer, (r) => {
       if (r.dispatchError) {
         const msg = r.dispatchError.isModule ? api.registry.findMetaError(r.dispatchError.asModule).name : r.dispatchError.toString();
@@ -51,7 +61,7 @@ function submit(api, tx, signer) {
     }).catch(reject);
   });
 }
-function fallbackSs58(addr) {
+function fallbackSs58(addr: string): string {
   const raw = new Uint8Array(32);
   raw.set(ethers.getBytes(addr), 0);
   raw.fill(0xee, 20);
@@ -60,7 +70,7 @@ function fallbackSs58(addr) {
 // `pallet_assets_precompiles::ERC20<Self, InlineIdConfig<0x0120>, TrustBackedAssetsInstance>`'s
 // address convention - assumed to match on AssetHub too (same polkadot-sdk crate/pattern). If
 // AssetHub's actual deployment uses a different prefix, adjust `prefix` accordingly.
-function precompileAddr(assetId, prefix = 0x0120) {
+function precompileAddr(assetId: number, prefix = 0x0120): string {
   const bytes = new Uint8Array(20);
   new DataView(bytes.buffer).setUint32(0, assetId, false);
   bytes[16] = (prefix >> 8) & 0xff;
@@ -68,7 +78,7 @@ function precompileAddr(assetId, prefix = 0x0120) {
   return ethers.getAddress(ethers.hexlify(bytes));
 }
 
-async function main() {
+async function main(): Promise<void> {
   await cryptoWaitReady();
   const keyring = new Keyring({ type: "sr25519" });
   const alice = keyring.addFromUri("//Alice");
@@ -106,7 +116,7 @@ async function main() {
   const xodeUsdtAddress = precompileAddr(assetId);
 
   const factory = new ethers.ContractFactory(VendingArtifact.abi, VendingArtifact.bytecode.object, deployer);
-  const vending = await factory.deploy(xodeUsdtAddress, owner.address, ethers.parseEther("5"), relayer.address);
+  const vending = (await factory.deploy(xodeUsdtAddress, owner.address, ethers.parseEther("5"), relayer.address)) as unknown as ethers.Contract;
   await vending.waitForDeployment();
   const vendingAddress = await vending.getAddress();
   console.log("vending:", vendingAddress);
@@ -122,12 +132,12 @@ async function main() {
   const ethSigner = new ethers.NonceManager(ethSignerWallet);
   const ethSignerAddress = ethSignerWallet.address;
   const mockUsdtFactory = new ethers.ContractFactory(MockUsdtArtifact.abi, MockUsdtArtifact.bytecode.object, ethSigner);
-  const mockUsdt = await mockUsdtFactory.deploy();
+  const mockUsdt = (await mockUsdtFactory.deploy()) as unknown as ethers.Contract;
   await mockUsdt.waitForDeployment();
   const mockUsdtAddress = await mockUsdt.getAddress();
 
   const ethGatewayFactory = new ethers.ContractFactory(GatewayArtifact.abi, GatewayArtifact.bytecode.object, ethSigner);
-  const ethGateway = await ethGatewayFactory.deploy(mockUsdtAddress, ethSignerAddress);
+  const ethGateway = (await ethGatewayFactory.deploy(mockUsdtAddress, ethSignerAddress)) as unknown as ethers.Contract;
   await ethGateway.waitForDeployment();
   const ethGatewayAddress = await ethGateway.getAddress();
   console.log("gateway (Ethereum):", ethGatewayAddress);
@@ -149,14 +159,14 @@ async function main() {
   const assetHubUsdtAddress = precompileAddr(assetId);
 
   const ahGatewayFactory = new ethers.ContractFactory(GatewayArtifact.abi, GatewayArtifact.bytecode.object, ahOwner);
-  const ahGateway = await ahGatewayFactory.deploy(assetHubUsdtAddress, ahOwner.address);
+  const ahGateway = (await ahGatewayFactory.deploy(assetHubUsdtAddress, ahOwner.address)) as unknown as ethers.Contract;
   await ahGateway.waitForDeployment();
   const ahGatewayAddress = await ahGateway.getAddress();
   console.log("gateway (AssetHub):", ahGatewayAddress);
 
   // --- Start the relayer with all three adapters ---
   rmSync("/home/jowel/Documents/GitHub/villenaj/xon-relayer/.checkpoints", { recursive: true, force: true });
-  const relayerProc = spawn(process.execPath, ["src/index.js"], {
+  const relayerProc = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
     cwd: "/home/jowel/Documents/GitHub/villenaj/xon-relayer",
     env: {
       ...process.env,
@@ -168,8 +178,8 @@ async function main() {
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  relayerProc.stdout.on("data", (d) => process.stdout.write(`[relayer] ${d}`));
-  relayerProc.stderr.on("data", (d) => process.stderr.write(`[relayer] ${d}`));
+  relayerProc.stdout.on("data", (d: Buffer) => process.stdout.write(`[relayer] ${d}`));
+  relayerProc.stderr.on("data", (d: Buffer) => process.stderr.write(`[relayer] ${d}`));
 
   await new Promise((r) => setTimeout(r, 5000)); // let all three adapters finish connecting
 
@@ -189,7 +199,7 @@ async function main() {
     // 3. AssetHub via UsdtGateway
     const ahUsdt = new ethers.Contract(assetHubUsdtAddress, ["function approve(address,uint256) returns (bool)"], ahDepositor);
     await (await ahUsdt.approve(ahGatewayAddress, 15_000_000n)).wait();
-    const ahGatewayAsDepositor = ahGateway.connect(ahDepositor);
+    const ahGatewayAsDepositor = ahGateway.connect(ahDepositor) as ethers.Contract;
     const ahReceipt = await (await ahGatewayAsDepositor.deposit(15_000_000n, assetHubBeneficiary.address)).wait();
     console.log("AssetHub deposit sent (15 USDT), tx:", ahReceipt.hash);
 
@@ -225,7 +235,7 @@ async function main() {
   }
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+main().catch((e: unknown) => { console.error(e); process.exit(1); });
 
 // Xode
 // 1. Transfer USDT to the vending machine contract to get XON

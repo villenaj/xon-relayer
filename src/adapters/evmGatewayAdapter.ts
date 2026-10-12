@@ -1,7 +1,7 @@
 // Watches `UsdtGateway.Deposited` events on any EVM-compatible chain other than Xode itself
 // (Ethereum, or AssetHub now that it runs pallet-revive) and settles the corresponding XON payout
-// on Xode. One instance of this adapter runs per such chain - see ethereumAdapter.js and
-// assetHubAdapter.js, which are both just this function called with a different chain config.
+// on Xode. One instance of this adapter runs per such chain - see ethereumAdapter.ts and
+// assetHubAdapter.ts, which are both just this function called with a different chain config.
 //
 // This is a custodial leg regardless of which chain it watches: USDT deposited into the gateway
 // contract just sits there under its `owner`'s control until manually moved - there's no on-chain
@@ -9,26 +9,37 @@
 // only thing connecting the two. See XonVendingMachine.sol's doc comment for the full trust story.
 
 import { ethers } from "ethers";
-import { readFileSync } from "node:fs";
 import path from "node:path";
 import { makeCheckpoint } from "../checkpoint.js";
 import { externalDepositId } from "../settlement.js";
-import { classifySettleError } from "../errorClassifier.js";
+import { classifySettleError, describeError } from "../errorClassifier.js";
+import type { AdapterContext } from "./types.js";
+import GATEWAY_ABI from "../abi/EthUsdtGateway.json" with { type: "json" };
 
-const GATEWAY_ABI = JSON.parse(readFileSync(new URL("../abi/EthUsdtGateway.json", import.meta.url)));
 const DEPOSITED_TOPIC = ethers.id("Deposited(address,address,uint256,uint256)");
 
-export async function runEvmGatewayAdapter({ settlement, config, sourceChain, label, rpcUrl, gatewayAddress, startBlock, checkpointFile }) {
+export interface EvmGatewayAdapterOptions extends AdapterContext {
+  sourceChain: string;
+  label: string;
+  rpcUrl: string;
+  gatewayAddress: string;
+  startBlock: number | null;
+  checkpointFile: string;
+}
+
+export async function runEvmGatewayAdapter({
+  settlement, config, sourceChain, label, rpcUrl, gatewayAddress, startBlock, checkpointFile,
+}: EvmGatewayAdapterOptions): Promise<never> {
   const provider = new ethers.JsonRpcProvider(rpcUrl);
   const gateway = new ethers.Contract(gatewayAddress, GATEWAY_ABI, provider);
   const resolvedGatewayAddress = await gateway.getAddress();
 
-  const checkpoint = makeCheckpoint(path.join(config.checkpointDir, checkpointFile), resolvedGatewayAddress);
+  const checkpoint = makeCheckpoint<number>(path.join(config.checkpointDir, checkpointFile), resolvedGatewayAddress);
 
   console.log(`[${label}] Watching UsdtGateway (${resolvedGatewayAddress}) deposits on ${rpcUrl}`);
 
   const checkpointed = checkpoint.load();
-  let fromBlock;
+  let fromBlock: number;
   if (checkpointed !== null) {
     fromBlock = checkpointed;
     console.log(`[${label}] Resuming from checkpoint: block ${fromBlock}.`);
@@ -40,18 +51,19 @@ export async function runEvmGatewayAdapter({ settlement, config, sourceChain, la
     console.warn(`[${label}] No checkpoint/start block - starting from current block (${fromBlock}). Pre-existing deposits will be missed.`);
   }
 
-  async function tick() {
+  async function tick(): Promise<void> {
     const latest = await provider.getBlockNumber();
     const toBlock = latest - config.confirmations;
     if (toBlock < fromBlock) return;
 
     const logs = await provider.getLogs({ address: resolvedGatewayAddress, topics: [DEPOSITED_TOPIC], fromBlock, toBlock });
-    let stalledAtBlock = null;
+    let stalledAtBlock: number | null = null;
 
     for (const log of logs) {
       const parsed = gateway.interface.parseLog(log);
-      const xodeBeneficiary = parsed.args.xodeBeneficiary;
-      const usdtAmount = parsed.args.usdtAmount;
+      if (!parsed) continue;
+      const xodeBeneficiary: string = parsed.args.xodeBeneficiary;
+      const usdtAmount: bigint = parsed.args.usdtAmount;
       const depositId = externalDepositId(sourceChain, log.transactionHash);
 
       if (await settlement.isExternalSettled(depositId)) {
@@ -71,7 +83,7 @@ export async function runEvmGatewayAdapter({ settlement, config, sourceChain, la
           console.error(`[${label}] Permanently skipping ${log.transactionHash} - reverted with ${name}, which can never succeed by retrying.`);
           continue;
         }
-        console.error(`[${label}] Failed to settle ${log.transactionHash} (${name ?? "unknown"}), will retry next tick:`, err.shortMessage ?? err.message);
+        console.error(`[${label}] Failed to settle ${log.transactionHash} (${name ?? "unknown"}), will retry next tick:`, describeError(err));
         stalledAtBlock = log.blockNumber;
         break;
       }
@@ -83,7 +95,7 @@ export async function runEvmGatewayAdapter({ settlement, config, sourceChain, la
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    await tick().catch((err) => console.error(`[${label}] Poll tick failed:`, err.shortMessage ?? err.message));
+    await tick().catch((err: unknown) => console.error(`[${label}] Poll tick failed:`, describeError(err)));
     await new Promise((resolve) => setTimeout(resolve, config.pollIntervalMs));
   }
 }

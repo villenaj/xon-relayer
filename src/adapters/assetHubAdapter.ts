@@ -4,15 +4,17 @@
 // Substrate-extrinsic-scanning approach this file used before AssetHub could run contracts.
 
 import { runEvmGatewayAdapter } from "./evmGatewayAdapter.js";
+import type { AdapterContext } from "./types.js";
 
-export function runAssetHubAdapter({ settlement, config }) {
+export function runAssetHubAdapter({ settlement, config }: AdapterContext): Promise<never> {
   return runEvmGatewayAdapter({
     settlement,
     config,
     sourceChain: "assethub",
     label: "assethub",
-    rpcUrl: config.assetHub.rpcUrl,
-    gatewayAddress: config.assetHub.gatewayAddress,
+    // validateConfig() guarantees both are set whenever this adapter is enabled.
+    rpcUrl: config.assetHub.rpcUrl!,
+    gatewayAddress: config.assetHub.gatewayAddress!,
     startBlock: config.assetHub.startBlock,
     checkpointFile: "assethub.json",
   });

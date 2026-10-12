@@ -3,10 +3,18 @@
   "version": "1.0.0",
   "description": "Standalone relayer service that pays out XON on Xode for USDT received on Xode itself, AssetHub, or Ethereum.",
   "type": "module",
-  "main": "src/index.js",
+  "main": "dist/index.js",
+  "engines": {
+    "node": ">=20.10"
+  },
   "scripts": {
-    "start": "node src/index.js",
-    "test:e2e": "node test/e2e.manual.js"
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test:e2e": "tsx test/e2e.manual.ts",
+    "test:multi-buyer": "tsx test/multiBuyer.manual.ts",
+    "test:poison-pill": "tsx test/poisonPill.manual.ts"
   },
   "dependencies": {
     "@polkadot/api": "^16.5.1",
@@ -14,5 +22,10 @@
     "@polkadot/util-crypto": "^14.0.3",
     "dotenv": "^17.2.3",
     "ethers": "^6.15.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
   }
 }

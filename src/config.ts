@@ -1,15 +1,20 @@
 import 'dotenv/config';
 
-function required(name) {
+function required(name: string): string {
   const value = process.env[name];
   if (!value) throw new Error(`Missing required env var: ${name}`);
   return value;
 }
 
-function bool(name, fallback) {
+function bool(name: string, fallback: boolean): boolean {
   const value = process.env[name];
   if (value === undefined) return fallback;
   return value === "true" || value === "1";
+}
+
+function optionalNumber(name: string): number | null {
+  const value = process.env[name];
+  return value ? Number(value) : null;
 }
 
 export const config = {
@@ -24,7 +29,7 @@ export const config = {
 
   // Only used on a genuinely first run (no checkpoint file yet) - e.g. if you're bootstrapping
   // the xode adapter against a contract that might already have unsettled deposits sitting on it.
-  xodeStartBlock: process.env.XODE_START_BLOCK ? Number(process.env.XODE_START_BLOCK) : null,
+  xodeStartBlock: optionalNumber("XODE_START_BLOCK"),
 
   adapters: {
     xode: bool("ENABLE_XODE_ADAPTER", true),
@@ -39,7 +44,7 @@ export const config = {
   assetHub: {
     rpcUrl: process.env.ASSETHUB_EVM_RPC,
     gatewayAddress: process.env.ASSETHUB_GATEWAY_ADDRESS,
-    startBlock: process.env.ASSETHUB_START_BLOCK ? Number(process.env.ASSETHUB_START_BLOCK) : null,
+    startBlock: optionalNumber("ASSETHUB_START_BLOCK"),
   },
 
   // Ethereum adapter - watches UsdtGateway.Deposited on the actual Ethereum network (or any
@@ -47,11 +52,13 @@ export const config = {
   ethereum: {
     rpcUrl: process.env.ETHEREUM_RPC,
     gatewayAddress: process.env.ETH_GATEWAY_ADDRESS,
-    startBlock: process.env.ETHEREUM_START_BLOCK ? Number(process.env.ETHEREUM_START_BLOCK) : null,
+    startBlock: optionalNumber("ETHEREUM_START_BLOCK"),
   },
 };
 
-export function validateConfig() {
+export type Config = typeof config;
+
+export function validateConfig(): void {
   if (config.adapters.assetHub && (!config.assetHub.rpcUrl || !config.assetHub.gatewayAddress)) {
     throw new Error("ENABLE_ASSETHUB_ADAPTER is on but ASSETHUB_EVM_RPC / ASSETHUB_GATEWAY_ADDRESS are not both set.");
   }

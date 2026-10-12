@@ -4,7 +4,7 @@ import { runXodeAdapter } from "./adapters/xodeAdapter.js";
 import { runAssetHubAdapter } from "./adapters/assetHubAdapter.js";
 import { runEthereumAdapter } from "./adapters/ethereumAdapter.js";
 
-async function main() {
+async function main(): Promise<void> {
   validateConfig();
 
   const settlement = await createSettlementClient({
@@ -15,7 +15,7 @@ async function main() {
   console.log(`Relayer address: ${settlement.relayerAddress}`);
   console.log(`Vending contract: ${config.vendingAddress}`);
 
-  const tasks = [];
+  const tasks: Promise<never>[] = [];
   if (config.adapters.xode) tasks.push(runXodeAdapter({ settlement, config }));
   if (config.adapters.assetHub) tasks.push(runAssetHubAdapter({ settlement, config }));
   if (config.adapters.ethereum) tasks.push(runEthereumAdapter({ settlement, config }));
@@ -30,7 +30,7 @@ async function main() {
   await Promise.race(tasks);
 }
 
-main().catch((err) => {
+main().catch((err: unknown) => {
   console.error(err);
   process.exit(1);
 });

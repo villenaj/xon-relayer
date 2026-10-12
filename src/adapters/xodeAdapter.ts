@@ -5,22 +5,23 @@
 import { ethers } from "ethers";
 import path from "node:path";
 import { makeCheckpoint } from "../checkpoint.js";
-import { classifySettleError } from "../errorClassifier.js";
+import { classifySettleError, describeError } from "../errorClassifier.js";
+import type { AdapterContext } from "./types.js";
 
 const LABEL = "xode";
 const TRANSFER_TOPIC = ethers.id("Transfer(address,address,uint256)");
 
-export async function runXodeAdapter({ settlement, config }) {
+export async function runXodeAdapter({ settlement, config }: AdapterContext): Promise<never> {
   const { provider, vending } = settlement;
   const vendingAddress = await vending.getAddress();
-  const usdtAddress = await vending.usdt();
+  const usdtAddress: string = await vending.usdt();
 
-  const checkpoint = makeCheckpoint(path.join(config.checkpointDir, "xode.json"), vendingAddress);
+  const checkpoint = makeCheckpoint<number>(path.join(config.checkpointDir, "xode.json"), vendingAddress);
 
   console.log(`[${LABEL}] Watching USDT (${usdtAddress}) transfers into ${vendingAddress}`);
 
   const checkpointed = checkpoint.load();
-  let fromBlock;
+  let fromBlock: number;
   if (checkpointed !== null) {
     fromBlock = checkpointed;
     console.log(`[${LABEL}] Resuming from checkpoint: block ${fromBlock}.`);
@@ -32,7 +33,7 @@ export async function runXodeAdapter({ settlement, config }) {
     console.warn(`[${LABEL}] No checkpoint/start block - starting from current block (${fromBlock}). Pre-existing deposits will be missed.`);
   }
 
-  async function tick() {
+  async function tick(): Promise<void> {
     const latest = await provider.getBlockNumber();
     const toBlock = latest - config.confirmations;
     if (toBlock < fromBlock) return;
@@ -42,7 +43,7 @@ export async function runXodeAdapter({ settlement, config }) {
     const logs = await provider.getLogs({ address: usdtAddress, topics: [TRANSFER_TOPIC], fromBlock, toBlock });
 
     const paddedVending = ethers.zeroPadValue(vendingAddress, 32).toLowerCase();
-    let stalledAtBlock = null;
+    let stalledAtBlock: number | null = null;
 
     for (const log of logs) {
       if (log.topics[2].toLowerCase() !== paddedVending) continue;
@@ -68,7 +69,7 @@ export async function runXodeAdapter({ settlement, config }) {
           console.error(`[${LABEL}] Permanently skipping ${depositTxHash} - reverted with ${name}, which can never succeed by retrying.`);
           continue;
         }
-        console.error(`[${LABEL}] Failed to settle ${depositTxHash} (${name ?? "unknown"}), will retry next tick:`, err.shortMessage ?? err.message);
+        console.error(`[${LABEL}] Failed to settle ${depositTxHash} (${name ?? "unknown"}), will retry next tick:`, describeError(err));
         stalledAtBlock = log.blockNumber;
         break;
       }
@@ -80,7 +81,7 @@ export async function runXodeAdapter({ settlement, config }) {
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    await tick().catch((err) => console.error(`[${LABEL}] Poll tick failed:`, err.shortMessage ?? err.message));
+    await tick().catch((err: unknown) => console.error(`[${LABEL}] Poll tick failed:`, describeError(err)));
     await new Promise((resolve) => setTimeout(resolve, config.pollIntervalMs));
   }
 }
