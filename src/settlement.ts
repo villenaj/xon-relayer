@@ -6,18 +6,26 @@ import type { JsonRpcProvider, NonceManager, TransactionReceipt, TransactionRequ
 import { describeError } from "./errorClassifier.js";
 import VENDING_ABI from "./abi/XonVendingMachine.json" with { type: "json" };
 
-// How long to wait for a settle tx before checking on it (and, if it's still pending, resending
-// it at the same nonce with higher fees), how often to poll for its receipt meanwhile, and how
-// many fee bumps to try before giving up on this attempt and leaving it to the next tick.
-const CONFIRM_TIMEOUT_MS = 60_000;
-const RECEIPT_POLL_MS = 2_000;
-const MAX_FEE_BUMPS = 3;
+export interface ConfirmTiming {
+  /// How long to wait for a settle tx before checking on it (and, if it's still pending,
+  /// resending it at the same nonce with higher fees).
+  confirmTimeoutMs: number;
+  /// How often to poll for its receipt meanwhile.
+  receiptPollMs: number;
+  /// How many fee bumps to try before giving up on this attempt and leaving it to the next tick.
+  maxFeeBumps: number;
+}
+
+const DEFAULT_TIMING: ConfirmTiming = { confirmTimeoutMs: 60_000, receiptPollMs: 2_000, maxFeeBumps: 3 };
 const FEE_BUMP_PERCENT = 125n; // geth-style pools need >= +10% to accept a replacement
 
-interface Sender {
-  provider: JsonRpcProvider;
-  wallet: Wallet;
-  signer: NonceManager;
+// Only what sendAndConfirm actually uses, so tests can supply fakes.
+type SenderProvider = Pick<JsonRpcProvider, "getTransactionReceipt" | "getTransaction" | "getFeeData" | "call">;
+
+export interface Sender {
+  provider: SenderProvider;
+  wallet: Pick<Wallet, "sendTransaction">;
+  signer: Pick<NonceManager, "reset">;
 }
 
 // Sends a settle tx and waits for it to be mined, recovering from the ways a shared NonceManager
@@ -28,10 +36,11 @@ interface Sender {
 //   - A tx dropped from the pool after being accepted leaves the same gap - also reset.
 //   - A tx stuck pending (underpriced) blocks every later nonce - resent at the same nonce with
 //     bumped fees. Settling is idempotent, so whichever copy lands is fine.
-async function sendAndConfirm(
+export async function sendAndConfirm(
   { provider, wallet, signer }: Sender,
   label: string,
   send: () => Promise<TransactionResponse>,
+  timing: ConfirmTiming = DEFAULT_TIMING,
 ): Promise<TransactionReceipt> {
   let original: TransactionResponse;
   try {
@@ -43,7 +52,7 @@ async function sendAndConfirm(
 
   const sent = [original];
   for (let bumps = 0; ; bumps++) {
-    const receipt = await pollForReceipt(provider, sent.map((tx) => tx.hash), CONFIRM_TIMEOUT_MS);
+    const receipt = await pollForReceipt(provider, sent.map((tx) => tx.hash), timing);
     if (receipt) {
       if (receipt.status !== 1) await throwRevertReason(provider, original, receipt, label);
       return receipt;
@@ -54,8 +63,8 @@ async function sendAndConfirm(
       signer.reset();
       throw new Error(`[${label}] Settle tx ${original.hash} (nonce ${original.nonce}) was dropped from the pool - nonce reset, will retry.`);
     }
-    if (bumps >= MAX_FEE_BUMPS) {
-      throw new Error(`[${label}] Settle tx ${original.hash} (nonce ${original.nonce}) still pending after ${MAX_FEE_BUMPS} fee bumps - will retry.`);
+    if (bumps >= timing.maxFeeBumps) {
+      throw new Error(`[${label}] Settle tx ${original.hash} (nonce ${original.nonce}) still pending after ${timing.maxFeeBumps} fee bumps - will retry.`);
     }
 
     const latest = sent[sent.length - 1];
@@ -71,7 +80,7 @@ async function sendAndConfirm(
         chainId: original.chainId,
         ...(await bumpedFees(provider, latest)),
       });
-      console.warn(`[${label}] Settle tx ${latest.hash} not mined after ${CONFIRM_TIMEOUT_MS / 1000}s - resent as ${replacement.hash} with higher fees.`);
+      console.warn(`[${label}] Settle tx ${latest.hash} not mined after ${timing.confirmTimeoutMs / 1000}s - resent as ${replacement.hash} with higher fees.`);
       sent.push(replacement);
     } catch (err) {
       // e.g. "nonce too low" because a copy just got mined, or the pool rejecting the bump - either
@@ -81,19 +90,19 @@ async function sendAndConfirm(
   }
 }
 
-async function pollForReceipt(provider: JsonRpcProvider, hashes: string[], timeoutMs: number): Promise<TransactionReceipt | null> {
-  const deadline = Date.now() + timeoutMs;
+async function pollForReceipt(provider: SenderProvider, hashes: string[], timing: ConfirmTiming): Promise<TransactionReceipt | null> {
+  const deadline = Date.now() + timing.confirmTimeoutMs;
   for (;;) {
     for (const hash of hashes) {
       const receipt = await provider.getTransactionReceipt(hash);
       if (receipt) return receipt;
     }
     if (Date.now() >= deadline) return null;
-    await new Promise((resolve) => setTimeout(resolve, RECEIPT_POLL_MS));
+    await new Promise((resolve) => setTimeout(resolve, timing.receiptPollMs));
   }
 }
 
-async function bumpedFees(provider: JsonRpcProvider, tx: TransactionResponse): Promise<TransactionRequest> {
+async function bumpedFees(provider: SenderProvider, tx: TransactionResponse): Promise<TransactionRequest> {
   const current = await provider.getFeeData();
   const bump = (v: bigint) => (v * FEE_BUMP_PERCENT) / 100n + 1n;
   const atLeast = (v: bigint, floor: bigint | null) => (floor !== null && floor > v ? floor : v);
@@ -111,7 +120,7 @@ async function bumpedFees(provider: JsonRpcProvider, tx: TransactionResponse): P
 // Replaying the exact same call via `eth_call` at the block it was mined in recovers the real
 // revert reason (verified with `cast call` against the same failure), which is what callers
 // actually need to classify permanent vs. transient errors.
-async function throwRevertReason(provider: JsonRpcProvider, tx: TransactionResponse, receipt: TransactionReceipt, label: string): Promise<never> {
+async function throwRevertReason(provider: SenderProvider, tx: TransactionResponse, receipt: TransactionReceipt, label: string): Promise<never> {
   // If the replay reverts, its error carries the decodable revert data.
   await provider.call({ to: tx.to, from: tx.from, data: tx.data, blockTag: receipt.blockNumber });
   throw new Error(`[${label}] Settle tx ${receipt.hash} reverted in block ${receipt.blockNumber} (replay gave no reason).`);

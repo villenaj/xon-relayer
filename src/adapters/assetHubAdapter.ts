@@ -16,6 +16,7 @@ export function runAssetHubAdapter(context: AdapterContext): Promise<void> {
     rpcUrl: config.assetHub.rpcUrl!,
     gatewayAddress: config.assetHub.gatewayAddress!,
     startBlock: config.assetHub.startBlock,
+    startBlockName: "ASSETHUB_START_BLOCK",
     confirmations: config.assetHub.confirmations,
     checkpointFile: config.assetHub.checkpointFile,
   });

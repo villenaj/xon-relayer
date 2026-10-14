@@ -25,7 +25,9 @@ for those two paths - see the contract-level comments in `XonVendingMachine.sol`
 
 Both the Ethereum and AssetHub legs are really the same adapter (`src/adapters/evmGatewayAdapter.ts`)
 called with different chain config - `ethereumAdapter.ts` and `assetHubAdapter.ts` are thin wrappers
-around it.
+around it. All three adapters run the same deposit loop (`src/adapters/depositScanner.ts`: resume
+from checkpoint, scan in chunks, settle in order, record outcomes); each adapter only says how to
+read a deposit from its chain's logs and how to settle it.
 
 ## Setup
 
@@ -37,8 +39,20 @@ npm start              # node dist/index.js
 ```
 
 For development, `npm run dev` runs `src/index.ts` directly via `tsx` (no build step), and
-`npm run typecheck` type-checks both `src/` and `test/`. The manual tests run with
-`npm run test:e2e`, `npm run test:multi-buyer` and `npm run test:poison-pill`.
+`npm run typecheck` type-checks both `src/` and `test/`.
+
+## Tests
+
+- `npm test` - unit tests (`test/unit/`, Node's built-in test runner, no chain needed; Node 22+).
+  They cover the deposit loop (ordering, stalling on transient failures, skipping permanent ones,
+  checkpoint resume, payout-cap gating, shutdown), stuck-tx recovery (nonce resets, fee-bumped
+  replacements, revert-reason replay), error classification, payout caps, checkpoints, the
+  ledger, chunked log scanning, health/metrics and shutdown.
+- `npm run test:e2e`, `test:multi-buyer`, `test:poison-pill` - manual end-to-end tests against a
+  local zombienet / anvil (see each file's header for the setup they need).
+
+CI (`.github/workflows/ci.yml`) runs typecheck, unit tests and build on every push to `main` and
+every pull request.
 
 Each of the three adapters can be toggled independently via `ENABLE_XODE_ADAPTER` /
 `ENABLE_ASSETHUB_ADAPTER` / `ENABLE_ETHEREUM_ADAPTER` in `.env` - run only what you need.

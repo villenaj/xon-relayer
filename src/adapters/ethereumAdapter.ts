@@ -11,6 +11,7 @@ export function runEthereumAdapter(context: AdapterContext): Promise<void> {
     rpcUrl: config.ethereum.rpcUrl!,
     gatewayAddress: config.ethereum.gatewayAddress!,
     startBlock: config.ethereum.startBlock,
+    startBlockName: "ETHEREUM_START_BLOCK",
     confirmations: config.ethereum.confirmations,
     checkpointFile: config.ethereum.checkpointFile,
   });
