@@ -6,7 +6,7 @@
 import { runEvmGatewayAdapter } from "./evmGatewayAdapter.js";
 import type { AdapterContext } from "./types.js";
 
-export function runAssetHubAdapter(context: AdapterContext): Promise<never> {
+export function runAssetHubAdapter(context: AdapterContext): Promise<void> {
   const { config } = context;
   return runEvmGatewayAdapter({
     ...context,

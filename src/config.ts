@@ -27,19 +27,23 @@ function confirmations(name: string, fallback: Confirmations): Confirmations {
 // USDT has 6 decimals on both Ethereum and AssetHub (asset 1984).
 export const USDT_DECIMALS = 6;
 
-/// A human-readable USDT amount ("5000", "1250.50") as raw units, or null if unset.
-function optionalUsdt(name: string): bigint | null {
+/// A human-readable token amount ("5000", "1250.50") as raw units, or null if unset.
+function optionalAmount(name: string, decimals: number, unit: string): bigint | null {
   const value = process.env[name];
   if (!value) return null;
   let amount: bigint;
   try {
-    amount = ethers.parseUnits(value, USDT_DECIMALS);
+    amount = ethers.parseUnits(value, decimals);
   } catch {
-    throw new Error(`${name} must be a USDT amount like "5000" or "1250.50" (got "${value}").`);
+    throw new Error(`${name} must be a ${unit} amount like "5000" or "1250.50" (got "${value}").`);
   }
-  if (amount <= 0n) throw new Error(`${name} must be greater than 0 (got "${value}") - leave it unset for no cap.`);
+  if (amount <= 0n) throw new Error(`${name} must be greater than 0 (got "${value}") - leave it unset to turn it off.`);
   return amount;
 }
+
+const optionalUsdt = (name: string) => optionalAmount(name, USDT_DECIMALS, "USDT");
+// XON is Xode's native token; its eth-rpc bridge reports balances with 18 decimals.
+const optionalXon = (name: string) => optionalAmount(name, 18, "XON");
 
 const checkpointDir = process.env.CHECKPOINT_DIR ?? ".checkpoints";
 
@@ -71,6 +75,25 @@ export const config = {
     maxPer24h: optionalUsdt("MAX_EXTERNAL_DAILY_USDT"),
   },
 
+  // /health + /metrics HTTP server (see telemetry.ts). HTTP_PORT=0 turns it off. Bound to
+  // localhost by default - put a reverse proxy in front, or set HTTP_HOST, to expose it.
+  httpHost: process.env.HTTP_HOST ?? "127.0.0.1",
+  httpPort: Number(process.env.HTTP_PORT ?? 9464),
+  // An adapter that hasn't caught up to its chain head for this long is reported unhealthy/alerted.
+  stallAlertAfterMs: Number(process.env.STALL_ALERT_AFTER_MS ?? 600_000),
+
+  // Balance monitoring (see monitor.ts). Unset thresholds mean no alert for that balance (it's
+  // still exported as a metric).
+  monitorIntervalMs: Number(process.env.MONITOR_INTERVAL_MS ?? 60_000),
+  minRelayerBalance: optionalXon("MIN_RELAYER_BALANCE_XON"),
+  minVendingReserve: optionalXon("MIN_VENDING_RESERVE_XON"),
+  // Optional chat webhook (Slack/Discord/Mattermost-style) that alerts are POSTed to.
+  alertWebhookUrl: process.env.ALERT_WEBHOOK_URL || null,
+
+  // How long to let in-flight settles finish after SIGTERM/SIGINT before exiting anyway. Keep
+  // systemd's TimeoutStopSec above this.
+  shutdownTimeoutMs: Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 120_000),
+
   adapters: {
     xode: bool("ENABLE_XODE_ADAPTER", true),
     assetHub: bool("ENABLE_ASSETHUB_ADAPTER", true),
@@ -101,8 +124,20 @@ export const config = {
 export type Config = typeof config;
 
 export function validateConfig(): void {
-  if (!Number.isInteger(config.logChunkSize) || config.logChunkSize < 1) {
-    throw new Error(`LOG_CHUNK_SIZE must be a positive integer (got "${process.env.LOG_CHUNK_SIZE}").`);
+  const positiveIntegers = {
+    POLL_INTERVAL_MS: config.pollIntervalMs,
+    LOG_CHUNK_SIZE: config.logChunkSize,
+    STALL_ALERT_AFTER_MS: config.stallAlertAfterMs,
+    MONITOR_INTERVAL_MS: config.monitorIntervalMs,
+    SHUTDOWN_TIMEOUT_MS: config.shutdownTimeoutMs,
+  };
+  for (const [name, value] of Object.entries(positiveIntegers)) {
+    if (!Number.isInteger(value) || value < 1) {
+      throw new Error(`${name} must be a positive integer (got "${process.env[name]}").`);
+    }
+  }
+  if (!Number.isInteger(config.httpPort) || config.httpPort < 0 || config.httpPort > 65535) {
+    throw new Error(`HTTP_PORT must be 0 (off) or a port number (got "${process.env.HTTP_PORT}").`);
   }
   if (config.adapters.assetHub && (!config.assetHub.rpcUrl || !config.assetHub.gatewayAddress)) {
     throw new Error("ENABLE_ASSETHUB_ADAPTER is on but ASSETHUB_EVM_RPC / ASSETHUB_GATEWAY_ADDRESS are not both set.");

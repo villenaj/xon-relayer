@@ -16,6 +16,7 @@ import { makeCheckpoint } from "../checkpoint.js";
 import { USDT_DECIMALS } from "../config.js";
 import { externalDepositId } from "../settlement.js";
 import { classifySettleError, describeError } from "../errorClassifier.js";
+import { runPollLoop } from "./pollLoop.js";
 import type { AdapterContext } from "./types.js";
 import GATEWAY_ABI from "../abi/EthUsdtGateway.json" with { type: "json" };
 
@@ -31,9 +32,12 @@ export interface EvmGatewayAdapterOptions extends AdapterContext {
   checkpointFile: string;
 }
 
-export async function runEvmGatewayAdapter({
-  settlement, config, ledger, limiter, sourceChain, label, rpcUrl, gatewayAddress, startBlock, confirmations, checkpointFile,
-}: EvmGatewayAdapterOptions): Promise<never> {
+export async function runEvmGatewayAdapter(options: EvmGatewayAdapterOptions): Promise<void> {
+  const {
+    settlement, config, ledger, limiter, alerts, shutdown,
+    sourceChain, label, rpcUrl, gatewayAddress, startBlock, confirmations, checkpointFile,
+  } = options;
+  const context: AdapterContext = options;
   const provider = new ethers.JsonRpcProvider(rpcUrl);
   const gateway = new ethers.Contract(gatewayAddress, GATEWAY_ABI, provider);
   const resolvedGatewayAddress = await gateway.getAddress();
@@ -55,9 +59,13 @@ export async function runEvmGatewayAdapter({
     console.warn(`[${label}] No checkpoint/start block - starting from current block (${fromBlock}). Pre-existing deposits will be missed.`);
   }
 
-  // Settles each deposit in order; returns the block of the first one that needs retrying, if any.
+  let capPaused = false;
+
+  // Settles each deposit in order; returns the block of the first one that needs retrying (or
+  // that shutdown interrupted before), if any.
   async function settleLogs(logs: Log[]): Promise<number | null> {
     for (const log of logs) {
+      if (shutdown.requested) return log.blockNumber;
       const parsed = gateway.interface.parseLog(log);
       if (!parsed) continue;
       const xodeBeneficiary: string = parsed.args.xodeBeneficiary;
@@ -76,14 +84,22 @@ export async function runEvmGatewayAdapter({
       const usdt = `${ethers.formatUnits(usdtAmount, USDT_DECIMALS)} USDT`;
 
       if (limiter.exceedsDepositCap(usdtAmount)) {
-        console.warn(`[${label}] Holding ${log.transactionHash} (${usdt}) - over the per-deposit payout cap. Release it with: npm run settle-held -- ${log.transactionHash}`);
+        alerts.send(`[${label}] Held deposit ${log.transactionHash}: ${usdt} to ${xodeBeneficiary} is over the per-deposit payout cap. After reviewing it, release with: npm run settle-held -- ${log.transactionHash}`);
         ledger.record({ ...entry, status: "held", error: "OverDepositCap" });
         continue;
       }
       const release = limiter.reserve(usdtAmount);
       if (!release) {
-        console.warn(`[${label}] 24h payout cap reached (${ethers.formatUnits(limiter.usedInWindow(), USDT_DECIMALS)} USDT paid) - pausing at ${log.transactionHash} (${usdt}) until it frees up.`);
+        const paid = `${ethers.formatUnits(limiter.usedInWindow(), USDT_DECIMALS)} USDT`;
+        if (!capPaused) {
+          alerts.send(`[${label}] 24h payout cap reached (${paid} paid) - pausing at ${log.transactionHash} (${usdt}) until older payouts age out.`);
+          capPaused = true;
+        }
         return log.blockNumber;
+      }
+      if (capPaused) {
+        console.log(`[${label}] Under the 24h payout cap again - resuming.`);
+        capPaused = false;
       }
 
       try {
@@ -110,18 +126,15 @@ export async function runEvmGatewayAdapter({
     return null;
   }
 
-  async function tick(): Promise<void> {
+  async function tick(): Promise<number> {
     const toBlock = await getSafeHead(provider, confirmations);
     const scan = { provider, address: resolvedGatewayAddress, topic: DEPOSITED_TOPIC, chunkSize: config.logChunkSize };
-    await scanLogs(scan, fromBlock, toBlock, settleLogs, (next) => {
-      fromBlock = next;
-      checkpoint.save(next);
-    });
+    const next = await scanLogs(scan, fromBlock, toBlock, settleLogs, (n) => {
+      fromBlock = n;
+      checkpoint.save(n);
+    }, () => shutdown.requested);
+    return Math.max(0, toBlock - next + 1);
   }
 
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    await tick().catch((err: unknown) => console.error(`[${label}] Poll tick failed:`, describeError(err)));
-    await new Promise((resolve) => setTimeout(resolve, config.pollIntervalMs));
-  }
+  await runPollLoop(context, label, tick);
 }

@@ -116,6 +116,40 @@ jq -c 'select(.status == "settled")' .checkpoints/ledger.jsonl
 jq -c 'select(.buyer == "0xYourAddress")' .checkpoints/ledger.jsonl
 ```
 
+## Health, metrics and alerts
+
+The relayer serves two endpoints on `http://127.0.0.1:9464` (`HTTP_HOST` / `HTTP_PORT`;
+`HTTP_PORT=0` turns them off):
+
+- `GET /health` - `200` when every adapter has caught up to its chain's safe head within
+  `STALL_ALERT_AFTER_MS` (default 10 min), `503` otherwise or while shutting down. The JSON body
+  has per-adapter detail (last poll, last caught up, blocks behind, consecutive failures) and any
+  low-balance warnings. "Caught up" rather than "polled" is what counts, so an adapter stuck
+  retrying one deposit shows as unhealthy even though it's still polling.
+- `GET /metrics` - Prometheus format: per-adapter last poll / last caught up / blocks behind /
+  poll failures, settle attempts by outcome, the relayer's gas balance, the vending contract's XON
+  reserve, and USDT paid in the current 24h cap window.
+
+Every `MONITOR_INTERVAL_MS` (default 60s) the relayer checks its own gas balance and the vending
+contract's XON reserve against `MIN_RELAYER_BALANCE_XON` / `MIN_VENDING_RESERVE_XON`. Alerts fire
+once when something goes wrong and once when it recovers:
+
+- a balance drops below its threshold (and when it's back above it),
+- an adapter stalls past `STALL_ALERT_AFTER_MS` (and when it catches up),
+- a deposit is held for being over the per-deposit cap,
+- the 24h payout cap pauses an adapter.
+
+Alerts are always logged; set `ALERT_WEBHOOK_URL` to also POST them to a chat webhook. The body
+carries the message as both `text` (Slack, Mattermost, Google Chat) and `content` (Discord).
+
+## Shutdown
+
+On `SIGTERM` (e.g. `systemctl stop`) or `SIGINT`, the relayer stops picking up new deposits, lets
+any settle already in flight finish, saves each adapter's checkpoint and exits. If that takes
+longer than `SHUTDOWN_TIMEOUT_MS` (default 120s), or a second signal arrives, it exits immediately.
+That's still safe: settling is idempotent, so an interrupted deposit is just retried on the next
+start. The systemd unit's `TimeoutStopSec=150` leaves room for the default timeout.
+
 ## Running on a server
 
 See `systemd/xon-relayer.service` for an example unit file. Key points:
@@ -125,3 +159,5 @@ See `systemd/xon-relayer.service` for an example unit file. Key points:
 - Run under a dedicated, no-login service user.
 - `CHECKPOINT_DIR` should point somewhere persistent and writable by that user.
 - The unit runs the compiled `dist/index.js`, so run `npm run build` as part of each deploy.
+- Point your monitoring at `/health` (or scrape `/metrics`) and set `ALERT_WEBHOOK_URL` and the
+  `MIN_*_XON` thresholds - otherwise nobody hears about a stalled adapter or a draining reserve.

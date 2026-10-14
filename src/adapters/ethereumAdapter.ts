@@ -1,7 +1,7 @@
 import { runEvmGatewayAdapter } from "./evmGatewayAdapter.js";
 import type { AdapterContext } from "./types.js";
 
-export function runEthereumAdapter(context: AdapterContext): Promise<never> {
+export function runEthereumAdapter(context: AdapterContext): Promise<void> {
   const { config } = context;
   return runEvmGatewayAdapter({
     ...context,

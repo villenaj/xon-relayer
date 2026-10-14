@@ -8,12 +8,14 @@ import path from "node:path";
 import { describeConfirmations, getSafeHead, scanLogs } from "../chain.js";
 import { makeCheckpoint } from "../checkpoint.js";
 import { classifySettleError, describeError } from "../errorClassifier.js";
+import { runPollLoop } from "./pollLoop.js";
 import type { AdapterContext } from "./types.js";
 
 const LABEL = "xode";
 const TRANSFER_TOPIC = ethers.id("Transfer(address,address,uint256)");
 
-export async function runXodeAdapter({ settlement, config, ledger }: AdapterContext): Promise<never> {
+export async function runXodeAdapter(context: AdapterContext): Promise<void> {
+  const { settlement, config, ledger, shutdown } = context;
   const { provider, vending } = settlement;
   const vendingAddress = await vending.getAddress();
   const usdtAddress: string = await vending.usdt();
@@ -37,10 +39,12 @@ export async function runXodeAdapter({ settlement, config, ledger }: AdapterCont
 
   const paddedVending = ethers.zeroPadValue(vendingAddress, 32).toLowerCase();
 
-  // Settles each deposit in order; returns the block of the first one that needs retrying, if any.
+  // Settles each deposit in order; returns the block of the first one that needs retrying (or
+  // that shutdown interrupted before), if any.
   async function settleLogs(logs: Log[]): Promise<number | null> {
     for (const log of logs) {
       if (log.topics[2].toLowerCase() !== paddedVending) continue;
+      if (shutdown.requested) return log.blockNumber;
 
       const buyer = ethers.getAddress(ethers.dataSlice(log.topics[1], 12));
       const amount = ethers.toBigInt(log.data);
@@ -80,20 +84,17 @@ export async function runXodeAdapter({ settlement, config, ledger }: AdapterCont
     return null;
   }
 
-  async function tick(): Promise<void> {
+  async function tick(): Promise<number> {
     const toBlock = await getSafeHead(provider, config.xodeConfirmations);
     // This bridge's eth_getLogs doesn't accept `null`/`[]` as a topic wildcard (confirmed
     // directly against it), so filter only by topic0 (Transfer) and match client-side above.
     const scan = { provider, address: usdtAddress, topic: TRANSFER_TOPIC, chunkSize: config.logChunkSize };
-    await scanLogs(scan, fromBlock, toBlock, settleLogs, (next) => {
-      fromBlock = next;
-      checkpoint.save(next);
-    });
+    const next = await scanLogs(scan, fromBlock, toBlock, settleLogs, (n) => {
+      fromBlock = n;
+      checkpoint.save(n);
+    }, () => shutdown.requested);
+    return Math.max(0, toBlock - next + 1);
   }
 
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    await tick().catch((err: unknown) => console.error(`[${LABEL}] Poll tick failed:`, describeError(err)));
-    await new Promise((resolve) => setTimeout(resolve, config.pollIntervalMs));
-  }
+  await runPollLoop(context, LABEL, tick);
 }

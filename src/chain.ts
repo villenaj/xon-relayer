@@ -47,21 +47,24 @@ export interface LogScan {
 /// chunking would make an adapter that fell behind (downtime, or an old start block) fail every
 /// tick forever. `handle` returns the block it stalled at (to retry from there), or null to move
 /// on; `onProgress` gets the next block to resume from after every chunk, so progress through a
-/// long backlog is checkpointed as it goes rather than only once it's all done.
+/// long backlog is checkpointed as it goes rather than only once it's all done. `shouldStop` is
+/// checked between chunks (for shutdown). Returns the next block to scan from.
 export async function scanLogs(
   { provider, address, topic, chunkSize }: LogScan,
   fromBlock: number,
   toBlock: number,
   handle: (logs: Log[]) => Promise<number | null>,
   onProgress: (nextFromBlock: number) => void,
-): Promise<void> {
+  shouldStop: () => boolean = () => false,
+): Promise<number> {
   let start = fromBlock;
-  while (start <= toBlock) {
+  while (start <= toBlock && !shouldStop()) {
     const end = Math.min(start + chunkSize - 1, toBlock);
     const logs = await provider.getLogs({ address, topics: [topic], fromBlock: start, toBlock: end });
     const stalledAtBlock = await handle(logs);
     start = stalledAtBlock ?? end + 1;
     onProgress(start);
-    if (stalledAtBlock !== null) return;
+    if (stalledAtBlock !== null) break;
   }
+  return start;
 }

@@ -11,6 +11,8 @@ EnvironmentFile=/etc/xon-relayer.env
 ExecStart=/usr/bin/node dist/index.js
 Restart=always
 RestartSec=5
+# Give in-flight settles time to finish on stop - keep above SHUTDOWN_TIMEOUT_MS (default 120s).
+TimeoutStopSec=150
 
 [Install]
 WantedBy=multi-user.target
