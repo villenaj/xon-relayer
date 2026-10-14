@@ -1,5 +1,6 @@
 import { config, validateConfig } from "./config.js";
 import { createSettlementClient } from "./settlement.js";
+import { makeLedger } from "./ledger.js";
 import { runXodeAdapter } from "./adapters/xodeAdapter.js";
 import { runAssetHubAdapter } from "./adapters/assetHubAdapter.js";
 import { runEthereumAdapter } from "./adapters/ethereumAdapter.js";
@@ -15,10 +16,14 @@ async function main(): Promise<void> {
   console.log(`Relayer address: ${settlement.relayerAddress}`);
   console.log(`Vending contract: ${config.vendingAddress}`);
 
+  const ledger = makeLedger(config.ledgerFile);
+  console.log(`Recording settle attempts to ${config.ledgerFile}`);
+
+  const context = { settlement, config, ledger };
   const tasks: Promise<never>[] = [];
-  if (config.adapters.xode) tasks.push(runXodeAdapter({ settlement, config }));
-  if (config.adapters.assetHub) tasks.push(runAssetHubAdapter({ settlement, config }));
-  if (config.adapters.ethereum) tasks.push(runEthereumAdapter({ settlement, config }));
+  if (config.adapters.xode) tasks.push(runXodeAdapter(context));
+  if (config.adapters.assetHub) tasks.push(runAssetHubAdapter(context));
+  if (config.adapters.ethereum) tasks.push(runEthereumAdapter(context));
 
   if (tasks.length === 0) {
     throw new Error("No adapters enabled - set ENABLE_XODE_ADAPTER/ENABLE_ASSETHUB_ADAPTER/ENABLE_ETHEREUM_ADAPTER.");

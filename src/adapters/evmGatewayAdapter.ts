@@ -28,7 +28,7 @@ export interface EvmGatewayAdapterOptions extends AdapterContext {
 }
 
 export async function runEvmGatewayAdapter({
-  settlement, config, sourceChain, label, rpcUrl, gatewayAddress, startBlock, checkpointFile,
+  settlement, config, ledger, sourceChain, label, rpcUrl, gatewayAddress, startBlock, checkpointFile,
 }: EvmGatewayAdapterOptions): Promise<never> {
   const provider = new ethers.JsonRpcProvider(rpcUrl);
   const gateway = new ethers.Contract(gatewayAddress, GATEWAY_ABI, provider);
@@ -71,19 +71,28 @@ export async function runEvmGatewayAdapter({
         continue;
       }
 
+      const entry = {
+        adapter: label, buyer: xodeBeneficiary, usdtAmount, sourceChain,
+        sourceTxHash: log.transactionHash, depositId, sourceBlock: log.blockNumber,
+      };
+
       try {
-        await settlement.settleExternal(xodeBeneficiary, usdtAmount, sourceChain, depositId, label);
+        const receipt = await settlement.settleExternal(xodeBeneficiary, usdtAmount, sourceChain, depositId, label);
+        ledger.record({ ...entry, status: "settled", settleTxHash: receipt.hash, settleBlock: receipt.blockNumber });
       } catch (err) {
         const { kind, name } = classifySettleError(settlement.vending, err);
         if (kind === "already-done") {
           console.log(`[${label}] ${log.transactionHash} was already settled by another attempt (${name}) - continuing.`);
+          ledger.record({ ...entry, status: "already-settled", error: name });
           continue;
         }
         if (kind === "permanent") {
           console.error(`[${label}] Permanently skipping ${log.transactionHash} - reverted with ${name}, which can never succeed by retrying.`);
+          ledger.record({ ...entry, status: "skipped", error: name });
           continue;
         }
         console.error(`[${label}] Failed to settle ${log.transactionHash} (${name ?? "unknown"}), will retry next tick:`, describeError(err));
+        ledger.record({ ...entry, status: "failed", error: name, message: describeError(err) });
         stalledAtBlock = log.blockNumber;
         break;
       }

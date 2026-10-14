@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import path from "node:path";
 
 function required(name: string): string {
   const value = process.env[name];
@@ -17,6 +18,8 @@ function optionalNumber(name: string): number | null {
   return value ? Number(value) : null;
 }
 
+const checkpointDir = process.env.CHECKPOINT_DIR ?? ".checkpoints";
+
 export const config = {
   // Xode side - every adapter ends up calling settlePurchase/settleExternalPurchase here.
   xodeEthRpc: process.env.XODE_ETH_RPC ?? "http://127.0.0.1:8546",
@@ -25,7 +28,9 @@ export const config = {
 
   pollIntervalMs: Number(process.env.POLL_INTERVAL_MS ?? 5000),
   confirmations: Number(process.env.CONFIRMATIONS ?? 1),
-  checkpointDir: process.env.CHECKPOINT_DIR ?? ".checkpoints",
+  checkpointDir,
+  // Append-only JSON Lines record of every settle attempt - see ledger.ts.
+  ledgerFile: process.env.LEDGER_FILE ?? path.join(checkpointDir, "ledger.jsonl"),
 
   // Only used on a genuinely first run (no checkpoint file yet) - e.g. if you're bootstrapping
   // the xode adapter against a contract that might already have unsettled deposits sitting on it.

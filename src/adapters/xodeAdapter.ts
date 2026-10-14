@@ -11,7 +11,7 @@ import type { AdapterContext } from "./types.js";
 const LABEL = "xode";
 const TRANSFER_TOPIC = ethers.id("Transfer(address,address,uint256)");
 
-export async function runXodeAdapter({ settlement, config }: AdapterContext): Promise<never> {
+export async function runXodeAdapter({ settlement, config, ledger }: AdapterContext): Promise<never> {
   const { provider, vending } = settlement;
   const vendingAddress = await vending.getAddress();
   const usdtAddress: string = await vending.usdt();
@@ -57,19 +57,29 @@ export async function runXodeAdapter({ settlement, config }: AdapterContext): Pr
         continue;
       }
 
+      // Native deposits are identified on-chain by their own tx hash, so depositId === sourceTxHash.
+      const entry = {
+        adapter: LABEL, buyer, usdtAmount: amount, sourceChain: "xode",
+        sourceTxHash: depositTxHash, depositId: depositTxHash, sourceBlock: log.blockNumber,
+      };
+
       try {
-        await settlement.settleNative(buyer, amount, depositTxHash, LABEL);
+        const receipt = await settlement.settleNative(buyer, amount, depositTxHash, LABEL);
+        ledger.record({ ...entry, status: "settled", settleTxHash: receipt.hash, settleBlock: receipt.blockNumber });
       } catch (err) {
         const { kind, name } = classifySettleError(settlement.vending, err);
         if (kind === "already-done") {
           console.log(`[${LABEL}] ${depositTxHash} was already settled by another attempt (${name}) - continuing.`);
+          ledger.record({ ...entry, status: "already-settled", error: name });
           continue;
         }
         if (kind === "permanent") {
           console.error(`[${LABEL}] Permanently skipping ${depositTxHash} - reverted with ${name}, which can never succeed by retrying.`);
+          ledger.record({ ...entry, status: "skipped", error: name });
           continue;
         }
         console.error(`[${LABEL}] Failed to settle ${depositTxHash} (${name ?? "unknown"}), will retry next tick:`, describeError(err));
+        ledger.record({ ...entry, status: "failed", error: name, message: describeError(err) });
         stalledAtBlock = log.blockNumber;
         break;
       }

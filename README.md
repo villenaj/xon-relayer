@@ -49,6 +49,33 @@ A deposit that fails to settle (transient RPC error, relayer temporarily out of 
 that adapter's checkpoint from advancing past it, so it's retried rather than abandoned - safe to
 retry because both `settlePurchase` and `settleExternalPurchase` are idempotent.
 
+## Transaction ledger
+
+Every settle attempt is appended to `.checkpoints/ledger.jsonl` (override with `LEDGER_FILE`), one
+JSON object per line:
+
+```json
+{"time":"2026-10-14T09:12:03.120Z","adapter":"ethereum","buyer":"0x…","usdtAmount":"20000000","sourceChain":"ethereum","sourceTxHash":"0x…","depositId":"0x…","sourceBlock":1234,"status":"settled","settleTxHash":"0x…","settleBlock":5678}
+```
+
+`status` is one of:
+
+- `settled` - XON paid out; `settleTxHash` / `settleBlock` point at the settle tx on Xode.
+- `already-settled` - another attempt had already settled this deposit.
+- `skipped` - reverted with a permanent error (`error`, e.g. `ZeroAmount`) and will never be retried.
+- `failed` - transient failure (`error` / `message`); retried next tick, so a stuck deposit logs
+  one `failed` line per poll until it settles or is fixed.
+
+`sourceTxHash` is the original deposit tx on its own chain; for AssetHub/Ethereum, `depositId` is
+the namespaced id the contract stores in `externalSettledDeposits`. The file is append-only and
+never rotated by the relayer - use `logrotate` (with `copytruncate`) if it grows large. Quick
+queries with `jq`:
+
+```bash
+jq -c 'select(.status == "settled")' .checkpoints/ledger.jsonl
+jq -c 'select(.buyer == "0xYourAddress")' .checkpoints/ledger.jsonl
+```
+
 ## Running on a server
 
 See `systemd/xon-relayer.service` for an example unit file. Key points:

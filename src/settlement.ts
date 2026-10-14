@@ -73,11 +73,12 @@ export async function createSettlementClient({ xodeEthRpc, vendingAddress, relay
     async isNativeSettled(depositTxHash: string): Promise<boolean> {
       return vending.settledDeposits(depositTxHash);
     },
-    async settleNative(buyer: string, usdtAmount: bigint, depositTxHash: string, label: string): Promise<void> {
+    async settleNative(buyer: string, usdtAmount: bigint, depositTxHash: string, label: string): Promise<ContractTransactionReceipt> {
       console.log(`[${label}] New deposit: ${buyer} sent ${usdtAmount.toString()} USDT (tx ${depositTxHash}). Settling...`);
       const tx: ContractTransactionResponse = await vending.settlePurchase(buyer, usdtAmount, depositTxHash);
       const receipt = await waitWithTimeout(tx, label, provider);
       console.log(`[${label}] Settled ${depositTxHash} in block ${receipt.blockNumber} (settle tx ${receipt.hash}).`);
+      return receipt;
     },
 
     // Cross-chain path: USDT paid on AssetHub or Ethereum - see XonVendingMachine's docs on the
@@ -85,11 +86,12 @@ export async function createSettlementClient({ xodeEthRpc, vendingAddress, relay
     async isExternalSettled(depositId: string): Promise<boolean> {
       return vending.externalSettledDeposits(depositId);
     },
-    async settleExternal(buyer: string, usdtAmount: bigint, sourceChain: string, depositId: string, label: string): Promise<void> {
+    async settleExternal(buyer: string, usdtAmount: bigint, sourceChain: string, depositId: string, label: string): Promise<ContractTransactionReceipt> {
       console.log(`[${label}] New deposit: ${buyer} paid ${usdtAmount.toString()} USDT on ${sourceChain} (id ${depositId}). Settling...`);
       const tx: ContractTransactionResponse = await vending.settleExternalPurchase(buyer, usdtAmount, sourceChain, depositId);
       const receipt = await waitWithTimeout(tx, label, provider);
       console.log(`[${label}] Settled ${depositId} in block ${receipt.blockNumber} (settle tx ${receipt.hash}).`);
+      return receipt;
     },
   };
 }

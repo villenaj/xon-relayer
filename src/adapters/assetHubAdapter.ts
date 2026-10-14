@@ -6,10 +6,10 @@
 import { runEvmGatewayAdapter } from "./evmGatewayAdapter.js";
 import type { AdapterContext } from "./types.js";
 
-export function runAssetHubAdapter({ settlement, config }: AdapterContext): Promise<never> {
+export function runAssetHubAdapter(context: AdapterContext): Promise<never> {
+  const { config } = context;
   return runEvmGatewayAdapter({
-    settlement,
-    config,
+    ...context,
     sourceChain: "assethub",
     label: "assethub",
     // validateConfig() guarantees both are set whenever this adapter is enabled.

@@ -1,10 +1,10 @@
 import { runEvmGatewayAdapter } from "./evmGatewayAdapter.js";
 import type { AdapterContext } from "./types.js";
 
-export function runEthereumAdapter({ settlement, config }: AdapterContext): Promise<never> {
+export function runEthereumAdapter(context: AdapterContext): Promise<never> {
+  const { config } = context;
   return runEvmGatewayAdapter({
-    settlement,
-    config,
+    ...context,
     sourceChain: "ethereum",
     label: "ethereum",
     // validateConfig() guarantees both are set whenever this adapter is enabled.
