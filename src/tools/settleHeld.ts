@@ -12,6 +12,7 @@ import { config, USDT_DECIMALS } from "../config.js";
 import { describeError } from "../errorClassifier.js";
 import { makeLedger, readLedger } from "../ledger.js";
 import { createSettlementClient, externalDepositId } from "../settlement.js";
+import { externalChain, runTool } from "./common.js";
 import GATEWAY_ABI from "../abi/EthUsdtGateway.json" with { type: "json" };
 
 const LABEL = "settle-held";
@@ -28,10 +29,8 @@ async function main(): Promise<void> {
     throw new Error(`No "held" ledger entry for ${sourceTxHash} in ${config.ledgerFile} - only held deposits can be released here.`);
   }
 
-  const chain = held.sourceChain === "assethub" ? config.assetHub : held.sourceChain === "ethereum" ? config.ethereum : null;
-  if (!chain?.rpcUrl || !chain.gatewayAddress) {
-    throw new Error(`No RPC/gateway configured for source chain "${held.sourceChain}".`);
-  }
+  const chain = externalChain(config, held.sourceChain);
+  if (!chain) throw new Error(`No RPC/gateway configured for source chain "${held.sourceChain}".`);
 
   // Re-derive the deposit from the source chain rather than trusting the ledger file.
   const provider = new ethers.JsonRpcProvider(chain.rpcUrl);
@@ -80,7 +79,4 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err: unknown) => {
-  console.error(err);
-  process.exit(1);
-});
+runTool(main);

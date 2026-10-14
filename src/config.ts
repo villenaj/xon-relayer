@@ -68,6 +68,7 @@ export const config = {
   xodeConfirmations: process.env.XODE_CONFIRMATIONS !== undefined
     ? confirmations("XODE_CONFIRMATIONS", 1)
     : confirmations("CONFIRMATIONS", 1),
+  xodeCheckpointFile: "xode.json",
 
   // Caps on AssetHub/Ethereum payouts, in USDT - see payoutLimits.ts. Unset means no cap.
   payoutLimits: {
@@ -109,6 +110,7 @@ export const config = {
     gatewayAddress: process.env.ASSETHUB_GATEWAY_ADDRESS,
     startBlock: optionalNumber("ASSETHUB_START_BLOCK"),
     confirmations: confirmations("ASSETHUB_CONFIRMATIONS", "finalized"),
+    checkpointFile: "assethub.json",
   },
 
   // Ethereum adapter - watches UsdtGateway.Deposited on the actual Ethereum network (or any
@@ -118,6 +120,7 @@ export const config = {
     gatewayAddress: process.env.ETH_GATEWAY_ADDRESS,
     startBlock: optionalNumber("ETHEREUM_START_BLOCK"),
     confirmations: confirmations("ETHEREUM_CONFIRMATIONS", "finalized"),
+    checkpointFile: "ethereum.json",
   },
 };
 

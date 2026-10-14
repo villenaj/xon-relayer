@@ -12,6 +12,6 @@ export function runEthereumAdapter(context: AdapterContext): Promise<void> {
     gatewayAddress: config.ethereum.gatewayAddress!,
     startBlock: config.ethereum.startBlock,
     confirmations: config.ethereum.confirmations,
-    checkpointFile: "ethereum.json",
+    checkpointFile: config.ethereum.checkpointFile,
   });
 }

@@ -11,6 +11,7 @@ export type LedgerStatus =
   | "already-settled" // another attempt got there first (AlreadySettled / AlreadyExternallySettled)
   | "skipped" // reverted with a permanent error - will never be retried
   | "held" // over the per-deposit payout cap - waits for an operator (npm run settle-held)
+  | "refunded" // a skipped deposit's USDT was returned to the payer (npm run refunds -- mark)
   | "failed"; // transient failure - will be retried next tick
 
 export interface LedgerEntry {
@@ -24,6 +25,8 @@ export interface LedgerEntry {
   sourceBlock: number;
   settleTxHash?: string;
   settleBlock?: number;
+  refundTxHash?: string;
+  refundTo?: string;
   error?: string | null;
   message?: string;
 }

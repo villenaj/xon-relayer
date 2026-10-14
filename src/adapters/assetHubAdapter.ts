@@ -17,6 +17,6 @@ export function runAssetHubAdapter(context: AdapterContext): Promise<void> {
     gatewayAddress: config.assetHub.gatewayAddress!,
     startBlock: config.assetHub.startBlock,
     confirmations: config.assetHub.confirmations,
-    checkpointFile: "assethub.json",
+    checkpointFile: config.assetHub.checkpointFile,
   });
 }

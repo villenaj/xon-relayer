@@ -13,6 +13,8 @@
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "settle-held": "node dist/tools/settleHeld.js",
+    "refunds": "node dist/tools/refunds.js",
+    "reconcile": "node dist/tools/reconcile.js",
     "test:e2e": "tsx test/e2e.manual.ts",
     "test:multi-buyer": "tsx test/multiBuyer.manual.ts",
     "test:poison-pill": "tsx test/poisonPill.manual.ts"

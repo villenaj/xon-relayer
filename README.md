@@ -103,6 +103,7 @@ JSON object per line:
 - `already-settled` - another attempt had already settled this deposit.
 - `skipped` - reverted with a permanent error (`error`, e.g. `ZeroAmount`) and will never be retried.
 - `held` - over a payout cap; waits for `npm run settle-held` (see Payout caps).
+- `refunded` - a `skipped` deposit's USDT was returned to the payer (`refundTxHash` / `refundTo`).
 - `failed` - transient failure (`error` / `message`); retried next tick, so a stuck deposit logs
   one `failed` line per poll until it settles or is fixed.
 
@@ -115,6 +116,53 @@ queries with `jq`:
 jq -c 'select(.status == "settled")' .checkpoints/ledger.jsonl
 jq -c 'select(.buyer == "0xYourAddress")' .checkpoints/ledger.jsonl
 ```
+
+## Refunds
+
+A `skipped` deposit (e.g. `ZeroAddress`, `XonTransferFailed`, or a dust amount that rounds to 0
+XON) can never be paid out, so its USDT is stuck: in the vending contract for a Xode deposit, in
+the gateway for an AssetHub/Ethereum one. Only that contract's **owner** can move it - not the
+relayer's key, on purpose - so the relayer doesn't send refunds; it tracks them:
+
+```bash
+npm run refunds                     # what's owed: chain, amount, who to refund, which contract holds it
+npm run refunds -- --all            # ...plus refunds already made
+npm run refunds -- mark <source tx> <refund tx>
+```
+
+Refunds go to whoever *paid* - for AssetHub/Ethereum that's the depositor on the source chain,
+looked up from the deposit tx, not the Xode beneficiary. `mark` checks the refund tx on-chain
+before recording it: it must have succeeded on the deposit's chain and moved at least the
+deposited amount of that chain's USDT to the payer. If it was refunded some other way, use
+`--force --note "how"`; the note is kept in the ledger.
+
+## Reconciliation
+
+`npm run reconcile` cross-checks the ledger against the chains (read-only) and exits `1` if it
+finds a problem, so it can run from cron:
+
+- **Unrecorded payout** - a `Settled`/`ExternalSettled` event on Xode with no ledger record:
+  something other than this relayer paid out (another instance, or a leaked key).
+- **Ledger-only settlement** - the ledger says paid, but there's no payout event (e.g. a reorg).
+- **Mismatch** - the ledger, the payout and the deposit disagree on amount or recipient.
+- **Missed deposit** - a deposit behind its adapter's checkpoint that was never paid and isn't
+  `skipped`, `held` or `refunded`.
+- **Multiple deposits in one tx** - several gateway deposits in one transaction share a deposit
+  id, so only one can ever be paid; the others need refunding.
+
+Held deposits and skipped deposits still awaiting a refund are listed as notes, not problems.
+Each chain is scanned from its configured start block, or else the earliest block the ledger
+mentions for it, up to its adapter's checkpoint. Override with `--xode-from`, `--assethub-from` or
+`--ethereum-from <block>`. Example cron entry for the service user, loading the same env file as
+the systemd unit and alerting only on failure:
+
+```cron
+0 6 * * * cd /opt/xon-relayer && set -a && . /etc/xon-relayer.env && node dist/tools/reconcile.js > /var/log/xon-reconcile.log 2>&1 || <your alert command>
+```
+
+The operator commands (`settle-held`, `refunds`, `reconcile`) read the same configuration as the
+relayer, so they need those variables too - from `.env` in the working directory, or the env file
+loaded as above.
 
 ## Health, metrics and alerts
 

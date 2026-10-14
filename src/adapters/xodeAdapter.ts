@@ -20,7 +20,7 @@ export async function runXodeAdapter(context: AdapterContext): Promise<void> {
   const vendingAddress = await vending.getAddress();
   const usdtAddress: string = await vending.usdt();
 
-  const checkpoint = makeCheckpoint<number>(path.join(config.checkpointDir, "xode.json"), vendingAddress);
+  const checkpoint = makeCheckpoint<number>(path.join(config.checkpointDir, config.xodeCheckpointFile), vendingAddress);
 
   console.log(`[${LABEL}] Watching USDT (${usdtAddress}) transfers into ${vendingAddress}, settling after ${describeConfirmations(config.xodeConfirmations)}`);
 
