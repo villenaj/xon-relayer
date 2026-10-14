@@ -108,7 +108,7 @@ async function main(): Promise<void> {
 
   const assetId = 1984;
   const existing = await xode.query.assets.asset(assetId);
-  if (existing.isNone) {
+  if (existing.isEmpty) {
     await submit(xode, xode.tx.assets.create(assetId, alice.address, 1), alice);
     await submit(xode, xode.tx.assets.setMetadata(assetId, "Tether USD", "USDT", USDT_DECIMALS), alice);
   }
@@ -151,7 +151,7 @@ async function main(): Promise<void> {
   await submit(assetHub, assetHub.tx.balances.transferKeepAlive(fallbackSs58(ahOwner.address), 1000n * UNIT), alice);
 
   const ahExisting = await assetHub.query.assets.asset(assetId);
-  if (ahExisting.isNone) {
+  if (ahExisting.isEmpty) {
     await submit(assetHub, assetHub.tx.assets.create(assetId, alice.address, 1), alice);
     await submit(assetHub, assetHub.tx.assets.setMetadata(assetId, "Tether USD", "USDT", USDT_DECIMALS), alice);
   }
@@ -171,7 +171,7 @@ async function main(): Promise<void> {
     env: {
       ...process.env,
       XODE_ETH_RPC, VENDING_ADDRESS: vendingAddress, RELAYER_PRIVATE_KEY: relayer.privateKey,
-      POLL_INTERVAL_MS: "2000", CONFIRMATIONS: "0",
+      POLL_INTERVAL_MS: "2000", CONFIRMATIONS: "0", ETHEREUM_CONFIRMATIONS: "0", ASSETHUB_CONFIRMATIONS: "0",
       ENABLE_XODE_ADAPTER: "true", ENABLE_ASSETHUB_ADAPTER: "true", ENABLE_ETHEREUM_ADAPTER: "true",
       ASSETHUB_EVM_RPC, ASSETHUB_GATEWAY_ADDRESS: ahGatewayAddress,
       ETHEREUM_RPC: ANVIL_RPC, ETH_GATEWAY_ADDRESS: ethGatewayAddress,

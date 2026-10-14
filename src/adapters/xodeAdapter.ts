@@ -3,7 +3,9 @@
 // `settlePurchase` in XonVendingMachine.sol).
 
 import { ethers } from "ethers";
+import type { Log } from "ethers";
 import path from "node:path";
+import { describeConfirmations, getSafeHead, scanLogs } from "../chain.js";
 import { makeCheckpoint } from "../checkpoint.js";
 import { classifySettleError, describeError } from "../errorClassifier.js";
 import type { AdapterContext } from "./types.js";
@@ -18,7 +20,7 @@ export async function runXodeAdapter({ settlement, config, ledger }: AdapterCont
 
   const checkpoint = makeCheckpoint<number>(path.join(config.checkpointDir, "xode.json"), vendingAddress);
 
-  console.log(`[${LABEL}] Watching USDT (${usdtAddress}) transfers into ${vendingAddress}`);
+  console.log(`[${LABEL}] Watching USDT (${usdtAddress}) transfers into ${vendingAddress}, settling after ${describeConfirmations(config.xodeConfirmations)}`);
 
   const checkpointed = checkpoint.load();
   let fromBlock: number;
@@ -33,18 +35,10 @@ export async function runXodeAdapter({ settlement, config, ledger }: AdapterCont
     console.warn(`[${LABEL}] No checkpoint/start block - starting from current block (${fromBlock}). Pre-existing deposits will be missed.`);
   }
 
-  async function tick(): Promise<void> {
-    const latest = await provider.getBlockNumber();
-    const toBlock = latest - config.confirmations;
-    if (toBlock < fromBlock) return;
+  const paddedVending = ethers.zeroPadValue(vendingAddress, 32).toLowerCase();
 
-    // This bridge's eth_getLogs doesn't accept `null`/`[]` as a topic wildcard (confirmed
-    // directly against it), so filter only by topic0 (Transfer) and match client-side below.
-    const logs = await provider.getLogs({ address: usdtAddress, topics: [TRANSFER_TOPIC], fromBlock, toBlock });
-
-    const paddedVending = ethers.zeroPadValue(vendingAddress, 32).toLowerCase();
-    let stalledAtBlock: number | null = null;
-
+  // Settles each deposit in order; returns the block of the first one that needs retrying, if any.
+  async function settleLogs(logs: Log[]): Promise<number | null> {
     for (const log of logs) {
       if (log.topics[2].toLowerCase() !== paddedVending) continue;
 
@@ -80,13 +74,21 @@ export async function runXodeAdapter({ settlement, config, ledger }: AdapterCont
         }
         console.error(`[${LABEL}] Failed to settle ${depositTxHash} (${name ?? "unknown"}), will retry next tick:`, describeError(err));
         ledger.record({ ...entry, status: "failed", error: name, message: describeError(err) });
-        stalledAtBlock = log.blockNumber;
-        break;
+        return log.blockNumber;
       }
     }
+    return null;
+  }
 
-    fromBlock = stalledAtBlock ?? toBlock + 1;
-    checkpoint.save(fromBlock);
+  async function tick(): Promise<void> {
+    const toBlock = await getSafeHead(provider, config.xodeConfirmations);
+    // This bridge's eth_getLogs doesn't accept `null`/`[]` as a topic wildcard (confirmed
+    // directly against it), so filter only by topic0 (Transfer) and match client-side above.
+    const scan = { provider, address: usdtAddress, topic: TRANSFER_TOPIC, chunkSize: config.logChunkSize };
+    await scanLogs(scan, fromBlock, toBlock, settleLogs, (next) => {
+      fromBlock = next;
+      checkpoint.save(next);
+    });
   }
 
   // eslint-disable-next-line no-constant-condition

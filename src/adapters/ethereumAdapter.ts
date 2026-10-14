@@ -11,6 +11,7 @@ export function runEthereumAdapter(context: AdapterContext): Promise<never> {
     rpcUrl: config.ethereum.rpcUrl!,
     gatewayAddress: config.ethereum.gatewayAddress!,
     startBlock: config.ethereum.startBlock,
+    confirmations: config.ethereum.confirmations,
     checkpointFile: "ethereum.json",
   });
 }

@@ -1,6 +1,8 @@
-import { config, validateConfig } from "./config.js";
+import { ethers } from "ethers";
+import { config, USDT_DECIMALS, validateConfig } from "./config.js";
 import { createSettlementClient } from "./settlement.js";
-import { makeLedger } from "./ledger.js";
+import { makeLedger, readLedger } from "./ledger.js";
+import { makePayoutLimiter } from "./payoutLimits.js";
 import { runXodeAdapter } from "./adapters/xodeAdapter.js";
 import { runAssetHubAdapter } from "./adapters/assetHubAdapter.js";
 import { runEthereumAdapter } from "./adapters/ethereumAdapter.js";
@@ -19,7 +21,18 @@ async function main(): Promise<void> {
   const ledger = makeLedger(config.ledgerFile);
   console.log(`Recording settle attempts to ${config.ledgerFile}`);
 
-  const context = { settlement, config, ledger };
+  const limiter = makePayoutLimiter(config.payoutLimits, readLedger(config.ledgerFile));
+  const { maxPerDeposit, maxPer24h } = config.payoutLimits;
+  const usdt = (v: bigint | null) => (v === null ? "no cap" : `${ethers.formatUnits(v, USDT_DECIMALS)} USDT`);
+  console.log(
+    `External payout caps: per deposit ${usdt(maxPerDeposit)}, per 24h ${usdt(maxPer24h)} ` +
+    `(${usdt(limiter.usedInWindow())} already paid in the last 24h).`,
+  );
+  if ((config.adapters.assetHub || config.adapters.ethereum) && maxPerDeposit === null && maxPer24h === null) {
+    console.warn("No MAX_EXTERNAL_DEPOSIT_USDT / MAX_EXTERNAL_DAILY_USDT set - AssetHub/Ethereum payouts are uncapped.");
+  }
+
+  const context = { settlement, config, ledger, limiter };
   const tasks: Promise<never>[] = [];
   if (config.adapters.xode) tasks.push(runXodeAdapter(context));
   if (config.adapters.assetHub) tasks.push(runAssetHubAdapter(context));

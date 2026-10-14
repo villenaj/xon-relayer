@@ -76,7 +76,7 @@ async function main(): Promise<void> {
 
   const assetId = 1984;
   const existing = await xode.query.assets.asset(assetId);
-  if (existing.isNone) {
+  if (existing.isEmpty) {
     await submit(xode, xode.tx.assets.create(assetId, alice.address, 1), alice);
     await submit(xode, xode.tx.assets.setMetadata(assetId, "Tether USD", "USDT", USDT_DECIMALS), alice);
   }

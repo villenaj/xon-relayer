@@ -3,13 +3,14 @@
 // Settled/ExternalSettled events, this also captures permanently skipped and failed attempts, and
 // the original source-chain tx hash behind each cross-chain depositId.
 
-import { appendFileSync, existsSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 export type LedgerStatus =
   | "settled" // settle tx confirmed on Xode
   | "already-settled" // another attempt got there first (AlreadySettled / AlreadyExternallySettled)
   | "skipped" // reverted with a permanent error - will never be retried
+  | "held" // over the per-deposit payout cap - waits for an operator (npm run settle-held)
   | "failed"; // transient failure - will be retried next tick
 
 export interface LedgerEntry {
@@ -26,6 +27,9 @@ export interface LedgerEntry {
   error?: string | null;
   message?: string;
 }
+
+/// An entry as stored on disk: amounts as decimal strings, plus the time it was written.
+export type LedgerRecord = Omit<LedgerEntry, "usdtAmount"> & { time: string; usdtAmount: string };
 
 export interface Ledger {
   record(entry: LedgerEntry): void;
@@ -47,4 +51,20 @@ export function makeLedger(filePath: string): Ledger {
       }
     },
   };
+}
+
+/// Every record in the ledger, oldest first. Malformed lines (e.g. one cut short by a crash
+/// mid-write) are skipped with a warning rather than failing the whole read.
+export function readLedger(filePath: string): LedgerRecord[] {
+  if (!existsSync(filePath)) return [];
+  const records: LedgerRecord[] = [];
+  readFileSync(filePath, "utf8").split("\n").forEach((line, i) => {
+    if (!line.trim()) return;
+    try {
+      records.push(JSON.parse(line) as LedgerRecord);
+    } catch {
+      console.warn(`[ledger] Ignoring malformed line ${i + 1} of ${filePath}.`);
+    }
+  });
+  return records;
 }
