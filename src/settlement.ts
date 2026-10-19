@@ -178,6 +178,18 @@ export async function createSettlementClient({ xodeEthRpc, vendingAddress, relay
 
     // Cross-chain path: USDT paid on AssetHub or Ethereum - see XonVendingMachine's docs on the
     // trust this implies (the relayer's attestation is the only input, not independently verified).
+    /// XonVendingMachine's own limits on external payouts (raw USDT units), or null if the
+    /// deployed contract predates them.
+    async externalLimits(): Promise<{ maxPerDeposit: bigint; maxPerDay: bigint; available: bigint } | null> {
+      try {
+        const [maxPerDeposit, maxPerDay, available]: bigint[] = await Promise.all([
+          vending.maxExternalPerDeposit(), vending.maxExternalPerDay(), vending.externalAvailable(),
+        ]);
+        return { maxPerDeposit, maxPerDay, available };
+      } catch {
+        return null;
+      }
+    },
     async isExternalSettled(depositId: string): Promise<boolean> {
       return vending.externalSettledDeposits(depositId);
     },

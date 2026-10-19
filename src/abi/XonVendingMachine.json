@@ -6,6 +6,9 @@
   "function externalSettledDeposits(bytes32) view returns (bool)",
   "function settlePurchase(address buyer, uint256 usdtAmount, bytes32 depositTxHash)",
   "function settleExternalPurchase(address buyer, uint256 usdtAmount, string sourceChain, bytes32 depositId)",
+  "function maxExternalPerDeposit() view returns (uint256)",
+  "function maxExternalPerDay() view returns (uint256)",
+  "function externalAvailable() view returns (uint256)",
   "event Settled(address indexed buyer, bytes32 indexed depositTxHash, uint256 usdtIn, uint256 xonOut)",
   "event ExternalSettled(address indexed buyer, string sourceChain, bytes32 indexed depositId, uint256 usdtIn, uint256 xonOut)",
   "error NotOwner()",
@@ -19,5 +22,7 @@
   "error Reentrant()",
   "error AlreadySettled()",
   "error UnverifiedDeposit()",
-  "error AlreadyExternallySettled()"
+  "error AlreadyExternallySettled()",
+  "error OverExternalDepositLimit()",
+  "error OverExternalDailyLimit()"
 ]

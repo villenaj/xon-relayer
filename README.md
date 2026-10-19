@@ -99,8 +99,17 @@ bound how much it will pay out automatically:
   `settle-held` count toward it from the next restart.
 
 The relayer logs a warning at startup if both are unset. These caps live in the relayer, so they
-guard against relayer bugs and bad deposits, not a stolen relayer key - that needs
-equivalent caps enforced in `XonVendingMachine` itself.
+guard against relayer bugs and bad deposits, not a stolen relayer key. For that, `XonVendingMachine`
+enforces its own limits on-chain (`setExternalLimits`, owner key): a per-deposit maximum and a daily
+allowance that refills continuously. Both start at 0, so AssetHub/Ethereum deposits are paid only
+once the owner sets them. Keep the relayer's caps at or below the on-chain ones. The relayer logs
+the on-chain limits at startup and warns if they're 0, lower than its own caps, or missing (an
+older contract). If a deposit goes over the on-chain limits anyway:
+
+- Over the per-deposit limit (`OverExternalDepositLimit`): the deposit is **held**, like one over
+  `MAX_EXTERNAL_DEPOSIT_USDT`. Raise the limit, then run `settle-held`.
+- Over the daily allowance (`OverExternalDailyLimit`): the adapter retries until the allowance
+  refills.
 
 ## Transaction ledger
 
@@ -116,7 +125,8 @@ JSON object per line:
 - `settled` - XON paid out; `settleTxHash` / `settleBlock` point at the settle tx on Xode.
 - `already-settled` - another attempt had already settled this deposit.
 - `skipped` - reverted with a permanent error (`error`, e.g. `ZeroAmount`) and will never be retried.
-- `held` - over a payout cap; waits for `npm run settle-held` (see Payout caps).
+- `held` - over a payout cap, the relayer's or the contract's (`error` says which); waits for
+  `npm run settle-held` (see Payout caps).
 - `refunded` - a `skipped` deposit's USDT was returned to the payer (`refundTxHash` / `refundTo`).
 - `failed` - transient failure (`error` / `message`); retried next tick, so a stuck deposit logs
   one `failed` line per poll until it settles or is fixed.
@@ -298,13 +308,16 @@ These run as the service user with the service's settings and key, via `systemd-
 - "Poll tick failed": the RPC is down or rate-limited.
 - "24h payout cap reached": intended. It resumes by itself, or raise `MAX_EXTERNAL_DAILY_USDT`
   and restart.
+- Repeated `OverExternalDailyLimit`: the contract's daily allowance is used up. It refills over
+  time; raise it with `setExternalLimits` if the volume is real.
 
 **Low balance (alert).** Top up the relayer address with XON for gas, or fund the vending contract's
 reserve. Settles that failed meanwhile are retried automatically.
 
 **Held deposit (alert).** Check the deposit on the source chain, then run
 `xon-relayer-cmd settle-held <tx>`, or refund the depositor if it shouldn't be paid. If the tx
-carries several deposits, the alert includes `--index <n>` for the one held.
+carries several deposits, the alert includes `--index <n>` for the one held. If it was held for
+`OverExternalDepositLimit`, raise the contract's limit with `setExternalLimits` first.
 
 **Skipped deposit / missed deposit (reconcile).** For skipped deposits, follow
 `xon-relayer-cmd refunds`. A missed deposit means a deposit sits behind a checkpoint unpaid, which

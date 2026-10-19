@@ -24,16 +24,19 @@ export function quiet(): void {
   for (const method of ["log", "warn", "error"] as const) mock.method(console, method, () => {});
 }
 
-/// A minimal AdapterContext: real shutdown, a ledger that collects entries in memory, and only the
-/// config fields the adapter loop reads.
-export function fakeContext(checkpointDir: string): AdapterContext & { entries: LedgerEntry[] } {
+/// A minimal AdapterContext: real shutdown, a ledger and alerts that collect into memory, and only
+/// the config fields the adapter loop reads.
+export function fakeContext(checkpointDir: string): AdapterContext & { entries: LedgerEntry[]; alertsSent: string[] } {
   const entries: LedgerEntry[] = [];
+  const alertsSent: string[] = [];
   const context = {
     settlement: { vending },
     config: { checkpointDir, logChunkSize: 100, pollIntervalMs: 1 },
     ledger: { record: (e: LedgerEntry) => entries.push(e) },
+    alerts: { send: (message: string) => alertsSent.push(message) },
     shutdown: makeShutdown(),
     entries,
+    alertsSent,
   };
-  return context as unknown as AdapterContext & { entries: LedgerEntry[] };
+  return context as unknown as AdapterContext & { entries: LedgerEntry[]; alertsSent: string[] };
 }

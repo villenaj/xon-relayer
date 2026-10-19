@@ -1,5 +1,6 @@
-// Operator command: pays out an AssetHub/Ethereum deposit the relayer held for being over the
-// per-deposit cap (status "held" in the ledger). Bypasses the caps - that's the point - so it only
+// Operator command: pays out an AssetHub/Ethereum deposit that was held for being over a
+// per-deposit cap - the relayer's own, or XonVendingMachine's on-chain limit (status "held" in the
+// ledger). Bypasses the relayer's caps - that's the point - though not the contract's, so it only
 // takes the ledger's word for *which chain* the deposit is on: the beneficiary and amount are
 // re-read from the deposit tx itself on the source chain, which must also be past that chain's
 // confirmation threshold.
@@ -10,7 +11,7 @@
 import { ethers } from "ethers";
 import { getSafeHead, makeProvider, verifyEndpoint } from "../chain.js";
 import { config, loadRelayerKey, USDT_DECIMALS } from "../config.js";
-import { describeError } from "../errorClassifier.js";
+import { classifySettleError, describeError } from "../errorClassifier.js";
 import { makeLedger, readLedger } from "../ledger.js";
 import { createSettlementClient, depositIdAt, externalDepositId } from "../settlement.js";
 import { DEPOSITED_TOPIC, externalChain, option, runTool } from "./common.js";
@@ -94,6 +95,13 @@ async function main(): Promise<void> {
     ledger.record({ ...entry, status: "settled", settleTxHash: settleReceipt.hash, settleBlock: settleReceipt.blockNumber });
   } catch (err) {
     ledger.record({ ...entry, status: "failed", message: describeError(err) });
+    const { name } = classifySettleError(settlement.vending, err);
+    if (name === "OverExternalDepositLimit") {
+      throw new Error(`${usdt} is over XonVendingMachine's own per-deposit limit - raise it with setExternalLimits (owner key) first, then run this again.`);
+    }
+    if (name === "OverExternalDailyLimit") {
+      throw new Error(`${usdt} is more than XonVendingMachine's daily allowance has left right now - try again later, or raise it with setExternalLimits (owner key).`);
+    }
     throw err;
   }
 }

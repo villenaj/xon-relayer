@@ -5,8 +5,8 @@
 //     instead of being paid automatically. It doesn't block later deposits.
 //   - per rolling 24h, across both external chains: once reached, those adapters pause (stall and
 //     retry) until older payouts age out of the window.
-// These run inside the relayer, so they don't protect against a stolen relayer key - that needs
-// equivalent caps in XonVendingMachine itself.
+// These run inside the relayer, so they don't protect against a stolen relayer key - that's what
+// XonVendingMachine's own on-chain limits (setExternalLimits) are for. Keep these at or below those.
 
 import type { LedgerRecord } from "./ledger.js";
 

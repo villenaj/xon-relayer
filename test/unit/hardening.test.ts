@@ -109,8 +109,15 @@ test("refuses no key, two keys, or a malformed key - without echoing the key", (
 
   const secretish = "0xnot-a-key-but-maybe-secret";
   withKeyEnv({ RELAYER_PRIVATE_KEY: secretish }, () => {
-    assert.throws(() => loadRelayerKey(), (err: Error) => /isn't a 0x-prefixed/.test(err.message) && !err.message.includes(secretish));
+    assert.throws(() => loadRelayerKey(), (err: Error) => /isn't a 32-byte hex private key/.test(err.message) && !err.message.includes(secretish));
   });
+});
+
+test("accepts a key without the 0x prefix, as wallets like MetaMask export it", () => {
+  withKeyEnv({ RELAYER_PRIVATE_KEY: KEY.slice(2) }, () => assert.equal(loadRelayerKey().key, KEY));
+  const file = path.join(tmpDir(), "key");
+  writeFileSync(file, `${KEY.slice(2)}\n`);
+  withKeyEnv({ RELAYER_PRIVATE_KEY_FILE: file }, () => assert.equal(loadRelayerKey().key, KEY));
 });
 
 // --- endpoint checks ---------------------------------------------------------------------------

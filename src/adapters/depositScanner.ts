@@ -65,7 +65,7 @@ export interface DepositScanner {
 }
 
 export async function createDepositScanner(context: AdapterContext, source: DepositSource): Promise<DepositScanner> {
-  const { settlement, config, ledger, shutdown } = context;
+  const { settlement, config, ledger, alerts, shutdown } = context;
   const { label, provider } = source;
   const checkpoint = makeCheckpoint<number>(path.join(config.checkpointDir, source.checkpointFile), source.checkpointIdentity);
 
@@ -133,6 +133,12 @@ export async function createDepositScanner(context: AdapterContext, source: Depo
         if (kind === "permanent") {
           console.error(`[${label}] Permanently skipping ${tx} - reverted with ${name}, which can never succeed by retrying.`);
           ledger.record({ ...entry, status: "skipped", error: name });
+          continue;
+        }
+        if (kind === "held") {
+          const release = `npm run settle-held -- ${tx}${deposit.depositIndex > 0 ? ` --index ${deposit.depositIndex}` : ""}`;
+          alerts.send(`[${label}] Held deposit ${tx}: ${name} - it's over XonVendingMachine's own limit. To pay it, raise the limit with setExternalLimits (owner key), then: ${release}`);
+          ledger.record({ ...entry, status: "held", error: name });
           continue;
         }
         console.error(`[${label}] Failed to settle ${tx} (${name ?? "unknown"}), will retry next tick:`, describeError(err));

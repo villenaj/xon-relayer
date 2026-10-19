@@ -2,7 +2,7 @@ import { ethers } from "ethers";
 import type { Server } from "node:http";
 import { config, loadRelayerKey, USDT_DECIMALS, validateConfig } from "./config.js";
 import { acquireInstanceLock } from "./instanceLock.js";
-import { createSettlementClient } from "./settlement.js";
+import { createSettlementClient, type SettlementClient } from "./settlement.js";
 import { makeLedger, readLedger, type Ledger } from "./ledger.js";
 import { makePayoutLimiter } from "./payoutLimits.js";
 import { makeAlerts } from "./alerts.js";
@@ -77,6 +77,7 @@ async function main(): Promise<void> {
   if ((config.adapters.assetHub || config.adapters.ethereum) && maxPerDeposit === null && maxPer24h === null) {
     console.warn("No MAX_EXTERNAL_DEPOSIT_USDT / MAX_EXTERNAL_DAILY_USDT set - AssetHub/Ethereum payouts are uncapped.");
   }
+  if (config.adapters.assetHub || config.adapters.ethereum) await checkOnChainLimits(settlement, maxPerDeposit, maxPer24h);
   if (config.minRelayerBalance === null || config.minVendingReserve === null) {
     console.warn("MIN_RELAYER_BALANCE_XON / MIN_VENDING_RESERVE_XON not both set - no low-balance alert for the unset one.");
   }
@@ -98,6 +99,29 @@ async function main(): Promise<void> {
 
   server?.close();
   console.log("Shut down cleanly.");
+}
+
+/// Logs XonVendingMachine's own limits on AssetHub/Ethereum payouts, and warns where they'd get in
+/// the way: off (nothing external gets paid), or tighter than the relayer's caps (deposits the
+/// relayer would pay get held or stall on the contract's limit instead).
+async function checkOnChainLimits(settlement: SettlementClient, relayerPerDeposit: bigint | null, relayerPer24h: bigint | null): Promise<void> {
+  const limits = await settlement.externalLimits();
+  if (!limits) {
+    console.warn("XonVendingMachine has no on-chain limits on external payouts (an older deployment) - a stolen relayer key could drain its whole reserve. See the redeploy steps in the xode-blockchain runbook.");
+    return;
+  }
+  const usdt = (v: bigint) => `${ethers.formatUnits(v, USDT_DECIMALS)} USDT`;
+  console.log(`On-chain external limits: per deposit ${usdt(limits.maxPerDeposit)}, per 24h ${usdt(limits.maxPerDay)} (${usdt(limits.available)} available now).`);
+  if (limits.maxPerDeposit === 0n || limits.maxPerDay === 0n) {
+    console.warn("XonVendingMachine's external limits are 0, so AssetHub/Ethereum deposits will all be held - the owner needs to call setExternalLimits.");
+    return;
+  }
+  if (relayerPerDeposit === null || relayerPerDeposit > limits.maxPerDeposit) {
+    console.warn("MAX_EXTERNAL_DEPOSIT_USDT is unset or above the on-chain per-deposit limit - deposits between the two will be held by the contract instead of the relayer. Set it at or below the on-chain limit.");
+  }
+  if (relayerPer24h === null || relayerPer24h > limits.maxPerDay) {
+    console.warn("MAX_EXTERNAL_DAILY_USDT is unset or above the on-chain daily limit - the adapters will stall on OverExternalDailyLimit instead of pausing at the relayer's cap. Set it at or below the on-chain limit.");
+  }
 }
 
 main().then(

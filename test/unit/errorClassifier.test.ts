@@ -15,8 +15,12 @@ test("already-settled reverts mean another attempt got there first", () => {
   }
 });
 
-test("reverts an operator can fix are transient", () => {
-  for (const name of ["IsPaused", "InsufficientReserve", "NotRelayer", "UnverifiedDeposit"]) {
+test("over the contract's own per-deposit limit is held for an operator", () => {
+  assert.deepEqual(classifySettleError(vending, revertError("OverExternalDepositLimit")), { kind: "held", name: "OverExternalDepositLimit" });
+});
+
+test("reverts an operator can fix, or that clear with time, are transient", () => {
+  for (const name of ["IsPaused", "InsufficientReserve", "NotRelayer", "UnverifiedDeposit", "OverExternalDailyLimit"]) {
     assert.deepEqual(classifySettleError(vending, revertError(name)), { kind: "transient", name });
   }
 });

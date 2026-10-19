@@ -85,9 +85,13 @@ export function loadRelayerKey(): { key: string; source: string } {
   // Keep the key out of anything this process spawns or dumps from here on.
   delete process.env.RELAYER_PRIVATE_KEY;
 
-  const key = read().trim();
-  // Never echo the value - only say what's wrong with it.
-  if (!/^0x[0-9a-fA-F]{64}$/.test(key)) throw new Error(`The relayer key from ${source} isn't a 0x-prefixed 32-byte hex private key.`);
+  const raw = read().trim();
+  // Never echo the value - only say what's wrong with it. Wallets often export keys without the
+  // 0x prefix (MetaMask does), so accept that too.
+  if (!/^(0x)?[0-9a-fA-F]{64}$/.test(raw)) {
+    throw new Error(`The relayer key from ${source} isn't a 32-byte hex private key (64 hex characters, optionally prefixed with 0x).`);
+  }
+  const key = raw.startsWith("0x") ? raw : `0x${raw}`;
   return { key, source };
 }
 

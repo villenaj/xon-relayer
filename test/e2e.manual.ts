@@ -130,6 +130,9 @@ async function main(): Promise<void> {
   console.log("vending:", vendingAddress);
   // 10 + 20 + 15 USDT at 5 XON/USDT = 225 XON needed across all three deposits - seed comfortably above that.
   await (await owner.sendTransaction({ to: vendingAddress, value: ethers.parseEther("500") })).wait();
+  // External payouts are off until the owner sets limits: 100 USDT per deposit, 1,000 per day.
+  const vendingAsOwner = vending.connect(owner) as ethers.Contract;
+  await (await vendingAsOwner.setExternalLimits(100_000_000n, 1_000_000_000n)).wait();
 
   // --- Ethereum (anvil) side: deploy MockUSDT + UsdtGateway ---
   // NonceManager avoids a real ethers v6 gotcha: a plain Wallet re-queries the "pending" nonce on

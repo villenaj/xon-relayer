@@ -114,6 +114,18 @@ test("a transient failure stalls at that deposit and retries it next poll, never
   assert.equal(checkpoint(), 201);
 });
 
+test("a deposit over the contract's own per-deposit limit is held, alerted, and passed over", async () => {
+  const { scanner, context, statuses, checkpoint } = await setup({
+    logs: [{ blockNumber: 110, transactionHash: "big" }, { blockNumber: 120, transactionHash: "b" }],
+    outcomes: { big: [revertError("OverExternalDepositLimit")] },
+  });
+  assert.equal(await scanner.tick(), 0);
+  assert.deepEqual(statuses(), ["big:held", "b:settled"]);
+  assert.equal(checkpoint(), 201);
+  assert.equal(context.alertsSent.length, 1);
+  assert.match(context.alertsSent[0], /setExternalLimits.*settle-held -- big/);
+});
+
 test("deposits already settled on-chain aren't sent again", async () => {
   const { scanner, attempts, context } = await setup({ logs: [{ blockNumber: 110, transactionHash: "a" }], alreadySettled: ["a"] });
   await scanner.tick();
