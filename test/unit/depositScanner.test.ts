@@ -4,6 +4,7 @@ import path from "node:path";
 import type { JsonRpcProvider, Log, TransactionReceipt } from "ethers";
 import { createDepositScanner, type DepositSource, type Gate } from "../../src/adapters/depositScanner.js";
 import { makeCheckpoint } from "../../src/checkpoint.js";
+import { depositIdAt } from "../../src/settlement.js";
 import { fakeContext, quiet, revertError, tmpDir } from "./helpers.js";
 
 quiet();
@@ -11,6 +12,8 @@ quiet();
 interface FakeLog {
   blockNumber: number;
   transactionHash: string;
+  index?: number;
+  amount?: bigint;
   notADeposit?: boolean;
 }
 
@@ -48,8 +51,9 @@ async function setup({ logs, head = 200, startBlock = 100, outcomes = {}, alread
     parse(log: Log) {
       const fake = log as unknown as FakeLog;
       if (fake.notADeposit) return null;
-      return { buyer: "0x01", usdtAmount: 5n, sourceChain: "test", sourceTxHash: fake.transactionHash, depositId: fake.transactionHash, sourceBlock: fake.blockNumber };
+      return { buyer: "0x01", usdtAmount: fake.amount ?? 5n, sourceChain: "test", sourceTxHash: fake.transactionHash, sourceBlock: fake.blockNumber };
     },
+    baseDepositId: (txHash) => txHash,
     isSettled: async (d) => settled.has(d.depositId),
     async settle(d) {
       attempts.push(d.sourceTxHash);
@@ -152,4 +156,49 @@ test("resumes from the checkpoint; with none and no start block, starts after th
   await fresh.scanner.tick();
   assert.deepEqual(fresh.attempts, []);
   assert.equal(fresh.checkpoint(), null, "nothing to scan yet");
+});
+
+// Several deposits in one tx (a multisig or smart-wallet batch). Hashes are real 32-byte values
+// because depositIdAt ABI-encodes them.
+const BATCH = `0x${"ab".repeat(32)}`;
+
+test("every deposit in a multi-deposit tx is paid, each under its own id - the first keeps the tx's id", async () => {
+  const { scanner, context } = await setup({
+    // Out of log order on purpose: numbering follows the log index, not the order the RPC returned.
+    logs: [
+      { blockNumber: 110, transactionHash: BATCH, index: 7, amount: 2n },
+      { blockNumber: 110, transactionHash: BATCH, index: 3, amount: 1n },
+      { blockNumber: 110, transactionHash: BATCH, index: 5, notADeposit: true },
+    ],
+  });
+  await scanner.tick();
+  assert.deepEqual(context.entries.map((e) => [e.status, e.depositIndex, e.usdtAmount, e.depositId]), [
+    ["settled", 0, 1n, BATCH],
+    ["settled", 1, 2n, depositIdAt(BATCH, 1)],
+  ]);
+  assert.notEqual(depositIdAt(BATCH, 1), BATCH);
+});
+
+test("a batch whose first deposit was settled under the old tx-hash-only id pays only the rest", async () => {
+  const { scanner, context } = await setup({
+    logs: [{ blockNumber: 110, transactionHash: BATCH, index: 0 }, { blockNumber: 110, transactionHash: BATCH, index: 1 }],
+    alreadySettled: [BATCH],
+  });
+  await scanner.tick();
+  assert.deepEqual(context.entries.map((e) => [e.status, e.depositIndex]), [["settled", 1]]);
+});
+
+test("retrying a batch after a stall numbers its deposits the same way", async () => {
+  const { scanner, context, checkpoint } = await setup({
+    logs: [{ blockNumber: 110, transactionHash: BATCH, index: 0 }, { blockNumber: 110, transactionHash: BATCH, index: 1 }],
+    outcomes: { [BATCH]: ["ok", new Error("ECONNRESET")] },
+  });
+  await scanner.tick();
+  assert.equal(checkpoint(), 110);
+  await scanner.tick();
+  assert.deepEqual(context.entries.map((e) => [e.status, e.depositIndex, e.depositId]), [
+    ["settled", 0, BATCH],
+    ["failed", 1, depositIdAt(BATCH, 1)],
+    ["settled", 1, depositIdAt(BATCH, 1)],
+  ]);
 });

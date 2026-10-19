@@ -196,3 +196,13 @@ export async function createSettlementClient({ xodeEthRpc, vendingAddress, relay
 export function externalDepositId(sourceChain: string, rawId: string): string {
   return ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(["string", "bytes32"], [sourceChain, rawId]));
 }
+
+/// The id of the `index`-th deposit (0-based) within one source tx, given the tx's base id (its
+/// hash for Xode, `externalDepositId` for AssetHub/Ethereum). One tx can carry several deposits -
+/// a batch from a multisig or smart wallet - and the base id alone would let only the first be
+/// paid. The first deposit keeps the base id itself, so every deposit settled before ids were
+/// indexed keeps the id it was settled under and can't be paid again.
+export function depositIdAt(baseId: string, index: number): string {
+  if (index === 0) return baseId;
+  return ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(["bytes32", "uint256"], [baseId, index]));
+}

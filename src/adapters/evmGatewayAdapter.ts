@@ -44,7 +44,8 @@ export async function runEvmGatewayAdapter(options: EvmGatewayAdapterOptions): P
   function gate(deposit: Deposit): Gate {
     const usdt = `${ethers.formatUnits(deposit.usdtAmount, USDT_DECIMALS)} USDT`;
     if (limiter.exceedsDepositCap(deposit.usdtAmount)) {
-      alerts.send(`[${label}] Held deposit ${deposit.sourceTxHash}: ${usdt} to ${deposit.buyer} is over the per-deposit payout cap. After reviewing it, release with: npm run settle-held -- ${deposit.sourceTxHash}`);
+      const release = `npm run settle-held -- ${deposit.sourceTxHash}${deposit.depositIndex > 0 ? ` --index ${deposit.depositIndex}` : ""}`;
+      alerts.send(`[${label}] Held deposit ${deposit.sourceTxHash}: ${usdt} to ${deposit.buyer} is over the per-deposit payout cap. After reviewing it, release with: ${release}`);
       ledger.record({ adapter: label, ...deposit, status: "held", error: "OverDepositCap" });
       return { action: "skip" };
     }
@@ -84,10 +85,10 @@ export async function runEvmGatewayAdapter(options: EvmGatewayAdapterOptions): P
         usdtAmount: parsed.args.usdtAmount,
         sourceChain,
         sourceTxHash: log.transactionHash,
-        depositId: externalDepositId(sourceChain, log.transactionHash),
         sourceBlock: log.blockNumber,
       };
     },
+    baseDepositId: (txHash) => externalDepositId(sourceChain, txHash),
     isSettled: (d) => settlement.isExternalSettled(d.depositId),
     settle: (d) => settlement.settleExternal(d.buyer, d.usdtAmount, sourceChain, d.depositId, label),
     gate,

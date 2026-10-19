@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { TransactionReceipt, TransactionRequest, TransactionResponse } from "ethers";
-import { sendAndConfirm, type Sender } from "../../src/settlement.js";
+import { depositIdAt, externalDepositId, sendAndConfirm, type Sender } from "../../src/settlement.js";
 import { quiet, revertError } from "./helpers.js";
 
 quiet();
@@ -131,4 +131,12 @@ test("a rejected replacement (e.g. the original just got mined) keeps waiting on
   chain.known.add("0x1");
   const result = await sendAndConfirm(sender, "t", async () => tx("0x1"), FAST);
   assert.equal(result.hash, "0x1");
+});
+
+test("a tx's first deposit keeps the tx's own id; later ones get distinct ids derived from it", () => {
+  const base = externalDepositId("ethereum", `0x${"cd".repeat(32)}`);
+  assert.equal(depositIdAt(base, 0), base);
+  const ids = new Set([0, 1, 2].map((i) => depositIdAt(base, i)));
+  assert.equal(ids.size, 3);
+  assert.notEqual(depositIdAt(base, 1), depositIdAt(externalDepositId("assethub", `0x${"cd".repeat(32)}`), 1));
 });

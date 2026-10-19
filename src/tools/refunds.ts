@@ -12,6 +12,8 @@
 //   npm run refunds -- mark <source tx> <refund tx> --force
 //                                                       record it without checking (e.g. refunded
 //                                                       some other way) - say why with --note "..."
+//   ... mark <source tx> <refund tx> --index <n>        pick one deposit when the source tx holds
+//                                                       several awaiting a refund
 
 import { ethers } from "ethers";
 import { makeProvider } from "../chain.js";
@@ -60,8 +62,11 @@ async function refundTarget(record: LedgerRecord): Promise<RefundTarget> {
   // The ledger records the Xode beneficiary; the refund goes to whoever actually paid on the
   // source chain, which only the deposit tx itself says.
   const receipt = await provider.getTransactionReceipt(record.sourceTxHash);
-  const log = receipt?.logs.find((l) => l.address.toLowerCase() === gatewayAddress.toLowerCase() && l.topics[0] === DEPOSITED_TOPIC);
-  if (!log) throw new Error(`Couldn't find the Deposited event for ${record.sourceTxHash} on ${record.sourceChain}.`);
+  const depositIndex = record.depositIndex ?? 0;
+  const log = receipt?.logs
+    .filter((l) => l.address.toLowerCase() === gatewayAddress.toLowerCase() && l.topics[0] === DEPOSITED_TOPIC)
+    .sort((a, b) => a.index - b.index)[depositIndex];
+  if (!log) throw new Error(`Couldn't find Deposited event #${depositIndex} for ${record.sourceTxHash} on ${record.sourceChain}.`);
   const payer: string = gateway.interface.parseLog(log)!.args.depositor;
   return { provider, payer, usdtAddress: await gateway.usdt(), heldBy: gatewayAddress };
 }
@@ -74,7 +79,8 @@ async function list(showAll: boolean): Promise<void> {
   let total = 0n;
   for (const r of pending) {
     total += BigInt(r.usdtAmount);
-    console.log(`${r.sourceChain.padEnd(9)} ${r.sourceTxHash}  ${usdt(BigInt(r.usdtAmount))}  (${r.error ?? "skipped"}, ${r.time})`);
+    const index = (r.depositIndex ?? 0) > 0 ? ` #${r.depositIndex}` : "";
+    console.log(`${r.sourceChain.padEnd(9)} ${r.sourceTxHash}${index}  ${usdt(BigInt(r.usdtAmount))}  (${r.error ?? "skipped"}, ${r.time})`);
     try {
       const t = await refundTarget(r);
       console.log(`          refund ${usdt(BigInt(r.usdtAmount))} (token ${t.usdtAddress}) to ${t.payer} on ${r.sourceChain}, from ${t.heldBy} using its owner key`);
@@ -83,7 +89,7 @@ async function list(showAll: boolean): Promise<void> {
     }
   }
   if (pending.length > 0) {
-    console.log(`\nTotal: ${usdt(total)}. After refunding, record it with: npm run refunds -- mark <source tx> <refund tx>`);
+    console.log(`\nTotal: ${usdt(total)}. After refunding, record it with: npm run refunds -- mark <source tx> <refund tx> [--index <n> for a #n deposit]`);
   }
 
   if (showAll) {
@@ -95,14 +101,22 @@ async function list(showAll: boolean): Promise<void> {
   }
 }
 
-async function mark(sourceTxHash: string | undefined, refundTxHash: string | undefined, force: boolean, note: string | undefined): Promise<void> {
+async function mark(sourceTxHash: string | undefined, refundTxHash: string | undefined, force: boolean, note: string | undefined, indexArg: string | undefined): Promise<void> {
   if (!sourceTxHash || !refundTxHash || !ethers.isHexString(sourceTxHash, 32) || !ethers.isHexString(refundTxHash, 32)) {
-    throw new Error("Usage: npm run refunds -- mark <source tx hash> <refund tx hash> [--force --note \"...\"]");
+    throw new Error("Usage: npm run refunds -- mark <source tx hash> <refund tx hash> [--index <n>] [--force --note \"...\"]");
   }
   if (force && !note) throw new Error("--force needs a --note \"...\" saying how the refund was made.");
+  const index = indexArg === undefined ? null : Number(indexArg);
+  if (index !== null && (!Number.isInteger(index) || index < 0)) throw new Error(`--index must be a deposit position like 0 or 1 (got "${indexArg}").`);
 
   const records = readLedger(config.ledgerFile);
-  const record = awaitingRefund(records).find((r) => r.sourceTxHash.toLowerCase() === sourceTxHash.toLowerCase());
+  const matches = awaitingRefund(records).filter((r) => r.sourceTxHash.toLowerCase() === sourceTxHash.toLowerCase()
+    && (index === null || (r.depositIndex ?? 0) === index));
+  if (matches.length > 1) {
+    const indexes = matches.map((r) => r.depositIndex ?? 0).sort((a, b) => a - b).join(", ");
+    throw new Error(`${sourceTxHash} has several deposits awaiting a refund (indexes ${indexes}) - pick one with --index <n>.`);
+  }
+  const [record] = matches;
   if (!record) {
     const refunded = records.some((r) => r.status === "refunded" && r.sourceTxHash.toLowerCase() === sourceTxHash.toLowerCase());
     throw new Error(refunded
@@ -138,6 +152,7 @@ async function mark(sourceTxHash: string | undefined, refundTxHash: string | und
     usdtAmount: amount,
     sourceChain: record.sourceChain,
     sourceTxHash: record.sourceTxHash,
+    depositIndex: record.depositIndex,
     depositId: record.depositId,
     sourceBlock: record.sourceBlock,
     refundTxHash,
@@ -150,7 +165,7 @@ async function mark(sourceTxHash: string | undefined, refundTxHash: string | und
 runTool(async () => {
   const args = process.argv.slice(2);
   if (args[0] === "mark") {
-    await mark(args[1], args[2], args.includes("--force"), option(args, "--note"));
+    await mark(args[1], args[2], args.includes("--force"), option(args, "--note"), option(args, "--index"));
   } else {
     await list(args.includes("--all"));
   }

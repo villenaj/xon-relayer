@@ -91,7 +91,7 @@ bound how much it will pay out automatically:
 
 - `MAX_EXTERNAL_DEPOSIT_USDT` - a deposit above this (or above the daily cap) is **held**: recorded
   in the ledger with status `held` and not paid. Later deposits carry on. To pay it after checking
-  it, run `npm run settle-held -- <source tx hash>`; this re-reads the deposit from the source
+  it, run `npm run settle-held -- <source tx hash>` (plus `--index <n>` if the alert gives one); this re-reads the deposit from the source
   chain (it doesn't trust the ledger for the amount or recipient) and settles it, bypassing the caps.
 - `MAX_EXTERNAL_DAILY_USDT` - total across both chains in any rolling 24 hours. Once reached, the
   AssetHub/Ethereum adapters pause at the next deposit and resume when older payouts age out. The
@@ -121,8 +121,13 @@ JSON object per line:
 - `failed` - transient failure (`error` / `message`); retried next tick, so a stuck deposit logs
   one `failed` line per poll until it settles or is fixed.
 
-`sourceTxHash` is the original deposit tx on its own chain; for AssetHub/Ethereum, `depositId` is
-the namespaced id the contract stores in `externalSettledDeposits`. The file is append-only and
+`sourceTxHash` is the original deposit tx on its own chain, and `depositIndex` says which of its
+deposits this is (0-based) - one tx can carry several, e.g. a batch from a multisig or smart
+wallet. `depositId` is the id the contract stores in `settledDeposits` / `externalSettledDeposits`:
+the tx hash for Xode, the chain-namespaced `externalDepositId` for AssetHub/Ethereum, with deposits
+after the first in a tx hashed together with their index (`depositIdAt` in `settlement.ts`). The
+first deposit's id is the same one used before deposits were indexed, so nothing settled earlier
+can be paid twice. Entries written before then have no `depositIndex`; read it as 0. The file is append-only and
 never rotated by the relayer - use `logrotate` (with `copytruncate`) if it grows large. Quick
 queries with `jq`:
 
@@ -161,8 +166,6 @@ finds a problem, so it can run from cron:
 - **Mismatch** - the ledger, the payout and the deposit disagree on amount or recipient.
 - **Missed deposit** - a deposit behind its adapter's checkpoint that was never paid and isn't
   `skipped`, `held` or `refunded`.
-- **Multiple deposits in one tx** - several gateway deposits in one transaction share a deposit
-  id, so only one can ever be paid; the others need refunding.
 
 Held deposits and skipped deposits still awaiting a refund are listed as notes, not problems.
 Each chain is scanned from its configured start block, or else the earliest block the ledger
@@ -266,7 +269,7 @@ sudo systemctl restart xon-relayer   # graceful: finishes in-flight settles firs
 ```bash
 sudo /opt/xon-relayer/systemd/xon-relayer-cmd reconcile
 sudo /opt/xon-relayer/systemd/xon-relayer-cmd refunds -- --all
-sudo /opt/xon-relayer/systemd/xon-relayer-cmd settle-held 0x<source tx hash>
+sudo /opt/xon-relayer/systemd/xon-relayer-cmd settle-held 0x<source tx hash> [--index <n>]
 ```
 
 These run as the service user with the service's settings and key, via `systemd-run`.
@@ -300,13 +303,18 @@ These run as the service user with the service's settings and key, via `systemd-
 reserve. Settles that failed meanwhile are retried automatically.
 
 **Held deposit (alert).** Check the deposit on the source chain, then run
-`xon-relayer-cmd settle-held <tx>`, or refund the depositor if it shouldn't be paid.
+`xon-relayer-cmd settle-held <tx>`, or refund the depositor if it shouldn't be paid. If the tx
+carries several deposits, the alert includes `--index <n>` for the one held.
 
 **Skipped deposit / missed deposit (reconcile).** For skipped deposits, follow
 `xon-relayer-cmd refunds`. A missed deposit means a deposit sits behind a checkpoint unpaid, which
 shouldn't happen. Check the ledger and logs around its block. To reprocess it, stop the relayer,
 set that adapter's checkpoint value (`/var/lib/xon-relayer/<chain>.json`) to the block, and start
 again. Already-settled deposits are skipped, so this is safe.
+
+Versions before deposits were indexed paid only the first deposit of a tx carrying several, and
+recorded nothing for the rest. After upgrading, `reconcile` reports those as missed deposits
+(`<tx> #1`, `#2`, ...); reprocess them the same way.
 
 **Relayer won't start, "Another relayer is already running".** Find the other process
 (`systemctl status xon-relayer`, `ps`). Only delete `/var/lib/xon-relayer/relayer.lock` once you're

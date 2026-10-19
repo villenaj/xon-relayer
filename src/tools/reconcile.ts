@@ -7,8 +7,7 @@
 //      amount.
 //   2. Deposits: every deposit on each source chain, up to that adapter's checkpoint (what the
 //      relayer claims to have processed), must be paid out on-chain or accounted for in the ledger
-//      (skipped / held / refunded) - otherwise it was missed. Also flags a tx holding several
-//      gateway deposits: they share one deposit id, so only the first can ever be paid.
+//      (skipped / held / refunded) - otherwise it was missed.
 //
 // Usage: npm run reconcile -- [--xode-from <block>] [--assethub-from <block>] [--ethereum-from <block>]
 // Each range defaults to the chain's configured start block, else the earliest block the ledger
@@ -21,7 +20,7 @@ import { makeProvider, scanLogs, verifyEndpoint } from "../chain.js";
 import { makeCheckpoint } from "../checkpoint.js";
 import { config, USDT_DECIMALS } from "../config.js";
 import { readLedger, type LedgerRecord, type LedgerStatus } from "../ledger.js";
-import { externalDepositId } from "../settlement.js";
+import { depositIdAt, externalDepositId } from "../settlement.js";
 import { blockOption, DEPOSITED_TOPIC, externalChains, runTool, TRANSFER_TOPIC } from "./common.js";
 import GATEWAY_ABI from "../abi/EthUsdtGateway.json" with { type: "json" };
 import VENDING_ABI from "../abi/XonVendingMachine.json" with { type: "json" };
@@ -48,6 +47,22 @@ async function collectLogs(provider: ethers.JsonRpcProvider, address: string, to
   }, () => {});
   return all;
 }
+
+/// Pairs each deposit log with its position among its tx's deposits - part of its deposit id (see
+/// depositIdAt). `logs` must be every deposit log of each tx they cover, as a whole-block scan gives.
+function withDepositIndex(logs: Log[]): { log: Log; index: number }[] {
+  const seen = new Map<string, number>();
+  return [...logs]
+    .sort((a, b) => a.blockNumber - b.blockNumber || a.index - b.index)
+    .map((log) => {
+      const index = seen.get(key(log.transactionHash)) ?? 0;
+      seen.set(key(log.transactionHash), index + 1);
+      return { log, index };
+    });
+}
+
+/// "0x…" or "0x… #2" - a source tx, plus which of its deposits when it isn't the first.
+const describeDeposit = (txHash: string, index: number) => (index === 0 ? txHash : `${txHash} #${index}`);
 
 /// The block after the last one an adapter's checkpoint says it finished, or null if it has none.
 function checkpointedUpTo(file: string, identity: string, label: string): number | null {
@@ -121,21 +136,22 @@ runTool(async () => {
   }
 
   // --- 2. Deposits on each source chain -------------------------------------------------------
-  async function checkDeposit(label: string, depositId: string, sourceTxHash: string, amount: bigint, settled: boolean): Promise<void> {
+  async function checkDeposit(label: string, depositId: string, sourceTxHash: string, index: number, amount: bigint, settled: boolean): Promise<void> {
+    const deposit = describeDeposit(sourceTxHash, index);
     if (settled) {
       const p = payouts.get(key(depositId));
       if (p && p.usdtIn !== amount) {
-        issues.push(`MISMATCH: ${label} deposit ${sourceTxHash} was ${usdt(amount)} but its payout ${p.txHash} was for ${usdt(p.usdtIn)}.`);
+        issues.push(`MISMATCH: ${label} deposit ${deposit} was ${usdt(amount)} but its payout ${p.txHash} was for ${usdt(p.usdtIn)}.`);
       }
       return;
     }
     if (has(depositId, "refunded")) return;
     if (has(depositId, "held")) {
-      notes.push(`${label} deposit ${sourceTxHash} (${usdt(amount)}) is held over the payout cap - npm run settle-held -- ${sourceTxHash}`);
+      notes.push(`${label} deposit ${deposit} (${usdt(amount)}) is held over the payout cap - npm run settle-held -- ${sourceTxHash}${index > 0 ? ` --index ${index}` : ""}`);
     } else if (has(depositId, "skipped")) {
-      if (amount > 0n) notes.push(`${label} deposit ${sourceTxHash} (${usdt(amount)}) was skipped and not yet refunded - see npm run refunds.`);
+      if (amount > 0n) notes.push(`${label} deposit ${deposit} (${usdt(amount)}) was skipped and not yet refunded - see npm run refunds.`);
     } else {
-      issues.push(`MISSED DEPOSIT: ${label} deposit ${sourceTxHash} (${usdt(amount)}) is behind the adapter's checkpoint but was never paid and isn't in the ledger as skipped/held/refunded.`);
+      issues.push(`MISSED DEPOSIT: ${label} deposit ${deposit} (${usdt(amount)}) is behind the adapter's checkpoint but was never paid and isn't in the ledger as skipped/held/refunded.`);
     }
   }
 
@@ -152,9 +168,10 @@ runTool(async () => {
       const usdtAddress: string = await vending.usdt();
       const paddedVending = key(ethers.zeroPadValue(vendingAddress, 32));
       const deposits = (await collectLogs(xode, usdtAddress, TRANSFER_TOPIC, from, to)).filter((l) => key(l.topics[2]) === paddedVending);
-      for (const log of deposits) {
-        const settled: boolean = await vending.settledDeposits(log.transactionHash);
-        await checkDeposit("xode", log.transactionHash, log.transactionHash, ethers.toBigInt(log.data), settled);
+      for (const { log, index } of withDepositIndex(deposits)) {
+        const depositId = depositIdAt(log.transactionHash, index);
+        const settled: boolean = await vending.settledDeposits(depositId);
+        await checkDeposit("xode", depositId, log.transactionHash, index, ethers.toBigInt(log.data), settled);
       }
       console.log(`Deposits on xode (blocks ${from}-${to}): ${deposits.length}.`);
     }
@@ -179,21 +196,11 @@ runTool(async () => {
     }
 
     const logs = await collectLogs(provider, gatewayAddress, DEPOSITED_TOPIC, from, to);
-    const perTx = new Map<string, number>();
-    for (const log of logs) perTx.set(key(log.transactionHash), (perTx.get(key(log.transactionHash)) ?? 0) + 1);
-    for (const [tx, count] of perTx) {
-      if (count > 1) {
-        issues.push(`MULTIPLE DEPOSITS IN ONE TX: ${chain.name} tx ${tx} has ${count} gateway deposits, but they share one deposit id, so only one can ever be paid out - the rest need refunding.`);
-      }
-    }
-    const checked = new Set<string>();
-    for (const log of logs) {
-      if (checked.has(key(log.transactionHash))) continue;
-      checked.add(key(log.transactionHash));
+    for (const { log, index } of withDepositIndex(logs)) {
       const amount: bigint = gateway.interface.parseLog(log)!.args.usdtAmount;
-      const depositId = externalDepositId(chain.name, log.transactionHash);
+      const depositId = depositIdAt(externalDepositId(chain.name, log.transactionHash), index);
       const settled: boolean = await vending.externalSettledDeposits(depositId);
-      await checkDeposit(chain.name, depositId, log.transactionHash, amount, settled);
+      await checkDeposit(chain.name, depositId, log.transactionHash, index, amount, settled);
     }
     console.log(`Deposits on ${chain.name} (blocks ${from}-${to}): ${logs.length}.`);
   }

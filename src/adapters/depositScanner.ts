@@ -12,6 +12,7 @@ import path from "node:path";
 import { describeConfirmations, getSafeHead, scanLogs, type Confirmations } from "../chain.js";
 import { makeCheckpoint } from "../checkpoint.js";
 import { classifySettleError, describeError } from "../errorClassifier.js";
+import { depositIdAt } from "../settlement.js";
 import type { AdapterContext } from "./types.js";
 
 export interface Deposit {
@@ -19,9 +20,14 @@ export interface Deposit {
   usdtAmount: bigint;
   sourceChain: string;
   sourceTxHash: string;
+  /// Position among this tx's deposits, 0-based - most txs carry exactly one.
+  depositIndex: number;
   depositId: string;
   sourceBlock: number;
 }
+
+/// A deposit as read from its log, before the scanner works out its position within the tx.
+export type ParsedDeposit = Omit<Deposit, "depositIndex" | "depositId">;
 
 /// What to do with a deposit before trying to settle it.
 export type Gate =
@@ -44,7 +50,9 @@ export interface DepositSource {
   startBlock: number | null;
   startBlockName: string;
   /// The deposit in this log, or null if the log isn't one (e.g. a transfer to someone else).
-  parse(log: Log): Deposit | null;
+  parse(log: Log): ParsedDeposit | null;
+  /// The id the contract tracks a tx's first deposit under; later ones derive from it (depositIdAt).
+  baseDepositId(sourceTxHash: string): string;
   isSettled(deposit: Deposit): Promise<boolean>;
   settle(deposit: Deposit): Promise<TransactionReceipt>;
   gate?(deposit: Deposit): Gate;
@@ -87,9 +95,17 @@ export async function createDepositScanner(context: AdapterContext, source: Depo
   // Settles each deposit in order; returns the block of the first one that needs retrying (or
   // that shutdown interrupted before), if any.
   async function settleLogs(logs: Log[]): Promise<number | null> {
-    for (const log of logs) {
-      const deposit = source.parse(log);
-      if (!deposit) continue;
+    // A deposit's id depends on its position within its tx, so number them in log order. A tx sits
+    // in one block, and a scan (or a retry after a stall) always covers whole blocks, so every
+    // deposit of a tx is numbered within the same call.
+    const ordered = [...logs].sort((a, b) => a.blockNumber - b.blockNumber || (a.index ?? 0) - (b.index ?? 0));
+    const depositsSeen = new Map<string, number>();
+    for (const log of ordered) {
+      const parsed = source.parse(log);
+      if (!parsed) continue;
+      const depositIndex = depositsSeen.get(parsed.sourceTxHash) ?? 0;
+      depositsSeen.set(parsed.sourceTxHash, depositIndex + 1);
+      const deposit: Deposit = { ...parsed, depositIndex, depositId: depositIdAt(source.baseDepositId(parsed.sourceTxHash), depositIndex) };
       if (shutdown.requested) return log.blockNumber;
       const tx = deposit.sourceTxHash;
 

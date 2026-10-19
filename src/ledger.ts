@@ -21,6 +21,9 @@ export interface LedgerEntry {
   usdtAmount: bigint;
   sourceChain: string;
   sourceTxHash: string;
+  /// Position among the source tx's deposits, 0-based. Absent from entries written before
+  /// deposits were indexed, which are all index 0.
+  depositIndex?: number;
   depositId: string;
   sourceBlock: number;
   settleTxHash?: string;

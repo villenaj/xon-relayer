@@ -32,16 +32,16 @@ export async function runXodeAdapter(context: AdapterContext): Promise<void> {
 
     parse(log) {
       if (log.topics[2].toLowerCase() !== paddedVending) return null;
-      // Native deposits are identified on-chain by their own tx hash, so depositId === sourceTxHash.
       return {
         buyer: ethers.getAddress(ethers.dataSlice(log.topics[1], 12)),
         usdtAmount: ethers.toBigInt(log.data),
         sourceChain: "xode",
         sourceTxHash: log.transactionHash,
-        depositId: log.transactionHash,
         sourceBlock: log.blockNumber,
       };
     },
+    // Native deposits are identified on-chain by their own tx hash (indexed past the first).
+    baseDepositId: (txHash) => txHash,
     isSettled: (d) => settlement.isNativeSettled(d.depositId),
     settle: (d) => settlement.settleNative(d.buyer, d.usdtAmount, d.depositId, LABEL),
   });

@@ -4,7 +4,7 @@
 #
 #   sudo /opt/xon-relayer/systemd/xon-relayer-cmd reconcile
 #   sudo /opt/xon-relayer/systemd/xon-relayer-cmd refunds -- --all
-#   sudo /opt/xon-relayer/systemd/xon-relayer-cmd settle-held 0x<source tx hash>
+#   sudo /opt/xon-relayer/systemd/xon-relayer-cmd settle-held 0x<source tx hash> [--index <n>]
 #
 # Keep the paths below in sync with xon-relayer.service.
 set -eu
