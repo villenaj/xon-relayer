@@ -1,0 +1,27 @@
+#!/bin/sh
+# Runs an operator command as the service user, with exactly the same settings, state directory
+# and relayer key credential as the systemd service - so you never handle the key yourself.
+#
+#   sudo /opt/xon-relayer/systemd/xon-relayer-cmd reconcile
+#   sudo /opt/xon-relayer/systemd/xon-relayer-cmd refunds -- --all
+#   sudo /opt/xon-relayer/systemd/xon-relayer-cmd settle-held 0x<source tx hash>
+#
+# Keep the paths below in sync with xon-relayer.service.
+set -eu
+
+case "${1:-}" in
+  settle-held) script=settleHeld ;;
+  refunds) script=refunds ;;
+  reconcile) script=reconcile ;;
+  *) echo "usage: $0 settle-held|refunds|reconcile [args...]" >&2; exit 2 ;;
+esac
+shift
+[ "${1:-}" = "--" ] && shift
+
+exec systemd-run --quiet --pipe --wait --collect \
+  -p User=xonrelayer -p Group=xonrelayer \
+  -p WorkingDirectory=/opt/xon-relayer \
+  -p EnvironmentFile=/etc/xon-relayer.env \
+  -p Environment=CHECKPOINT_DIR=/var/lib/xon-relayer \
+  -p LoadCredentialEncrypted=relayer-key:/etc/xon-relayer/relayer-key.cred \
+  /usr/bin/node "dist/tools/$script.js" "$@"
