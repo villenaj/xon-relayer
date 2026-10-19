@@ -5,16 +5,23 @@
 //
 // Needs the same local infra as test/e2e.manual.ts (zombienet + eth-rpc), Xode only for this one.
 //
-// Usage: npx tsx test/poisonPill.manual.ts
+// Usage: npm run test:poison-pill   (CONTRACTS_OUT as in test/e2e.manual.ts)
 
 import { ApiPromise, WsProvider } from "@polkadot/api";
 import { Keyring } from "@polkadot/keyring";
 import { cryptoWaitReady, encodeAddress } from "@polkadot/util-crypto";
 import { ethers } from "ethers";
-import { readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import type { SubmittableExtrinsic } from "@polkadot/api/types";
 import type { KeyringPair } from "@polkadot/keyring/types";
+
+// This repo, and xode-blockchain's `forge build` output (default: a sibling checkout of it).
+const REPO = fileURLToPath(new URL("..", import.meta.url));
+const CONTRACTS_OUT = process.env.CONTRACTS_OUT ?? path.resolve(REPO, "../xode-blockchain/contracts/out");
 
 const XODE_WS = "ws://127.0.0.1:9977";
 const XODE_ETH_RPC = "http://127.0.0.1:8545";
@@ -29,7 +36,7 @@ function loadArtifact(file: string): ForgeArtifact {
   return JSON.parse(readFileSync(file, "utf8")) as ForgeArtifact;
 }
 
-const VendingArtifact = loadArtifact("/home/jowel/Documents/GitHub/villenaj/xode-blockchain/contracts/out/XonVendingMachine.sol/XonVendingMachine.json");
+const VendingArtifact = loadArtifact(`${CONTRACTS_OUT}/XonVendingMachine.sol/XonVendingMachine.json`);
 
 function submit(api: ApiPromise, tx: SubmittableExtrinsic<"promise">, signer: KeyringPair): Promise<void> {
   return new Promise<void>((resolve, reject) => {
@@ -105,11 +112,17 @@ async function main(): Promise<void> {
   const goodReceipt = await (await usdt.transfer(vendingAddress, 10_000_000n)).wait();
   console.log("legitimate deposit tx:", goodReceipt.hash);
 
-  rmSync("/home/jowel/Documents/GitHub/villenaj/xon-relayer/.checkpoints", { recursive: true, force: true });
+  const checkpointDir = mkdtempSync(path.join(tmpdir(), "xon-relayer-test-"));
+  console.log("relayer state (checkpoints, ledger):", checkpointDir);
   const relayerProc = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
-    cwd: "/home/jowel/Documents/GitHub/villenaj/xon-relayer",
+    cwd: REPO,
     env: {
       ...process.env,
+      // Isolate the run: its own checkpoints and ledger, no HTTP port, and none of a developer .env's
+      // production settings (key file, alert webhook, chain IDs, payout caps).
+      CHECKPOINT_DIR: checkpointDir, LEDGER_FILE: path.join(checkpointDir, "ledger.jsonl"), HTTP_PORT: "0",
+      RELAYER_PRIVATE_KEY_FILE: "", CREDENTIALS_DIRECTORY: "", ALERT_WEBHOOK_URL: "",
+      XODE_CHAIN_ID: "", ASSETHUB_CHAIN_ID: "", ETHEREUM_CHAIN_ID: "", MAX_EXTERNAL_DEPOSIT_USDT: "", MAX_EXTERNAL_DAILY_USDT: "",
       XODE_ETH_RPC, VENDING_ADDRESS: vendingAddress, RELAYER_PRIVATE_KEY: relayer.privateKey,
       POLL_INTERVAL_MS: "2000", CONFIRMATIONS: "0", XODE_START_BLOCK: String(startBlock),
       ENABLE_XODE_ADAPTER: "true", ENABLE_ASSETHUB_ADAPTER: "false", ENABLE_ETHEREUM_ADAPTER: "false",

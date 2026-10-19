@@ -9,7 +9,7 @@
 // only thing connecting the two. See XonVendingMachine.sol's doc comment for the full trust story.
 
 import { ethers } from "ethers";
-import type { Confirmations } from "../chain.js";
+import { makeProvider, verifyEndpoint, type Confirmations } from "../chain.js";
 import { USDT_DECIMALS } from "../config.js";
 import { externalDepositId } from "../settlement.js";
 import { runDepositScanner, type Deposit, type Gate } from "./depositScanner.js";
@@ -26,12 +26,15 @@ export interface EvmGatewayAdapterOptions extends AdapterContext {
   startBlock: number | null;
   startBlockName: string;
   confirmations: Confirmations;
+  /// Chain ID the RPC must report, if configured.
+  expectedChainId: bigint | null;
   checkpointFile: string;
 }
 
 export async function runEvmGatewayAdapter(options: EvmGatewayAdapterOptions): Promise<void> {
   const { settlement, ledger, limiter, alerts, sourceChain, label, rpcUrl } = options;
-  const provider = new ethers.JsonRpcProvider(rpcUrl);
+  const provider = makeProvider(rpcUrl, options.config.rpcTimeoutMs);
+  await verifyEndpoint(provider, { label, expectedChainId: options.expectedChainId, contracts: { UsdtGateway: options.gatewayAddress } });
   const gateway = new ethers.Contract(options.gatewayAddress, GATEWAY_ABI, provider);
   const gatewayAddress = await gateway.getAddress();
 

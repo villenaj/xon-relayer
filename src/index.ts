@@ -1,6 +1,7 @@
 import { ethers } from "ethers";
 import type { Server } from "node:http";
-import { config, USDT_DECIMALS, validateConfig } from "./config.js";
+import { config, loadRelayerKey, USDT_DECIMALS, validateConfig } from "./config.js";
+import { acquireInstanceLock } from "./instanceLock.js";
 import { createSettlementClient } from "./settlement.js";
 import { makeLedger, readLedger, type Ledger } from "./ledger.js";
 import { makePayoutLimiter } from "./payoutLimits.js";
@@ -14,6 +15,11 @@ import { runEthereumAdapter } from "./adapters/ethereumAdapter.js";
 
 async function main(): Promise<void> {
   validateConfig();
+  acquireInstanceLock(config.checkpointDir);
+  const relayerKey = loadRelayerKey();
+  if (relayerKey.source.startsWith("RELAYER_PRIVATE_KEY env")) {
+    console.warn("Relayer key comes from a plain env var - fine for development, but use the systemd credential in production (see README).");
+  }
 
   // SIGTERM (systemd stop) / SIGINT (Ctrl+C): stop taking on new deposits, let the one in flight
   // finish, save checkpoints, exit. A second signal, or the timeout, exits immediately - safe,
@@ -45,10 +51,12 @@ async function main(): Promise<void> {
   const settlement = await createSettlementClient({
     xodeEthRpc: config.xodeEthRpc,
     vendingAddress: config.vendingAddress,
-    relayerPrivateKey: config.relayerPrivateKey,
+    relayerPrivateKey: relayerKey.key,
+    expectedChainId: config.xodeChainId,
+    rpcTimeoutMs: config.rpcTimeoutMs,
   });
-  console.log(`Relayer address: ${settlement.relayerAddress}`);
-  console.log(`Vending contract: ${config.vendingAddress}`);
+  console.log(`Relayer address: ${settlement.relayerAddress} (key from ${relayerKey.source})`);
+  console.log(`Vending contract: ${config.vendingAddress} on Xode chain ${settlement.chainId}`);
 
   const fileLedger = makeLedger(config.ledgerFile);
   const ledger: Ledger = {

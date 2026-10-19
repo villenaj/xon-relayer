@@ -18,6 +18,7 @@ export function runAssetHubAdapter(context: AdapterContext): Promise<void> {
     startBlock: config.assetHub.startBlock,
     startBlockName: "ASSETHUB_START_BLOCK",
     confirmations: config.assetHub.confirmations,
+    expectedChainId: config.assetHub.chainId,
     checkpointFile: config.assetHub.checkpointFile,
   });
 }

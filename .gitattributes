@@ -1,0 +1,2 @@
+# Deployed to Linux as-is: a CRLF here breaks the shell script and systemd unit.
+systemd/* text eol=lf

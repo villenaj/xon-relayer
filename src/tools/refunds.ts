@@ -14,6 +14,7 @@
 //                                                       some other way) - say why with --note "..."
 
 import { ethers } from "ethers";
+import { makeProvider } from "../chain.js";
 import { config, USDT_DECIMALS } from "../config.js";
 import { makeLedger, readLedger, type LedgerRecord } from "../ledger.js";
 import { DEPOSITED_TOPIC, externalChain, option, runTool, TRANSFER_TOPIC } from "./common.js";
@@ -45,7 +46,7 @@ function awaitingRefund(records: LedgerRecord[]): LedgerRecord[] {
 
 async function refundTarget(record: LedgerRecord): Promise<RefundTarget> {
   if (record.sourceChain === "xode") {
-    const provider = new ethers.JsonRpcProvider(config.xodeEthRpc);
+    const provider = makeProvider(config.xodeEthRpc, config.rpcTimeoutMs);
     const vending = new ethers.Contract(config.vendingAddress, VENDING_ABI, provider);
     // For a Xode-native deposit the ledger's buyer *is* the USDT sender.
     return { provider, payer: record.buyer, usdtAddress: await vending.usdt(), heldBy: await vending.getAddress() };
@@ -53,7 +54,7 @@ async function refundTarget(record: LedgerRecord): Promise<RefundTarget> {
 
   const chain = externalChain(config, record.sourceChain);
   if (!chain) throw new Error(`No RPC/gateway configured for source chain "${record.sourceChain}".`);
-  const provider = new ethers.JsonRpcProvider(chain.rpcUrl);
+  const provider = makeProvider(chain.rpcUrl, config.rpcTimeoutMs);
   const gateway = new ethers.Contract(chain.gatewayAddress, GATEWAY_ABI, provider);
   const gatewayAddress = await gateway.getAddress();
   // The ledger records the Xode beneficiary; the refund goes to whoever actually paid on the

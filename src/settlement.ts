@@ -3,6 +3,7 @@
 
 import { ethers } from "ethers";
 import type { JsonRpcProvider, NonceManager, TransactionReceipt, TransactionRequest, TransactionResponse, Wallet } from "ethers";
+import { makeProvider, verifyEndpoint } from "./chain.js";
 import { describeError } from "./errorClassifier.js";
 import VENDING_ABI from "./abi/XonVendingMachine.json" with { type: "json" };
 
@@ -130,12 +131,16 @@ export interface SettlementClientOptions {
   xodeEthRpc: string;
   vendingAddress: string;
   relayerPrivateKey: string;
+  /// Chain ID the Xode RPC must report, if configured.
+  expectedChainId: bigint | null;
+  rpcTimeoutMs: number;
 }
 
 export type SettlementClient = Awaited<ReturnType<typeof createSettlementClient>>;
 
-export async function createSettlementClient({ xodeEthRpc, vendingAddress, relayerPrivateKey }: SettlementClientOptions) {
-  const provider = new ethers.JsonRpcProvider(xodeEthRpc);
+export async function createSettlementClient({ xodeEthRpc, vendingAddress, relayerPrivateKey, expectedChainId, rpcTimeoutMs }: SettlementClientOptions) {
+  const provider = makeProvider(xodeEthRpc, rpcTimeoutMs);
+  const chainId = await verifyEndpoint(provider, { label: "xode", expectedChainId, contracts: { XonVendingMachine: vendingAddress } });
   const wallet = new ethers.Wallet(relayerPrivateKey, provider);
   // All three adapters share this one client (and its one signer) - without NonceManager, two
   // adapters settling around the same moment race on the "pending" nonce lookup a plain Wallet
@@ -149,13 +154,14 @@ export async function createSettlementClient({ xodeEthRpc, vendingAddress, relay
   const onChainRelayer: string = await vending.relayer();
   if (onChainRelayer.toLowerCase() !== wallet.address.toLowerCase()) {
     throw new Error(
-      `RELAYER_PRIVATE_KEY (${wallet.address}) does not match XonVendingMachine's relayer (${onChainRelayer}). ` +
+      `The relayer key (${wallet.address}) does not match XonVendingMachine's relayer (${onChainRelayer}). ` +
       `Call setRelayer on the contract first, or use the right key.`,
     );
   }
 
   return {
     provider,
+    chainId,
     vending,
     relayerAddress: wallet.address,
 

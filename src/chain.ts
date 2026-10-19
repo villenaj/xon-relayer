@@ -1,7 +1,42 @@
-// Chain-reading helpers shared by every adapter: how far back from the head counts as "safe to
-// settle", and walking a block range in chunks small enough for RPC providers to accept.
+// Chain-reading helpers shared by every adapter: connecting with sane timeouts, checking at startup
+// that an RPC is the chain and contract we think it is, how far back from the head counts as "safe
+// to settle", and walking a block range in chunks small enough for RPC providers to accept.
 
-import type { JsonRpcProvider, Log } from "ethers";
+import { FetchRequest, JsonRpcProvider, type Log } from "ethers";
+
+export const DEFAULT_RPC_TIMEOUT_MS = 30_000;
+
+/// A JSON-RPC provider with a request timeout. ethers' default is 5 minutes, long enough for one
+/// hung RPC call to freeze an adapter's whole poll (and its health) for that long.
+export function makeProvider(url: string, timeoutMs = DEFAULT_RPC_TIMEOUT_MS): JsonRpcProvider {
+  const request = new FetchRequest(url);
+  request.timeout = timeoutMs;
+  return new JsonRpcProvider(request);
+}
+
+export interface EndpointCheck {
+  label: string;
+  /// Chain ID the RPC must report, or null to accept any (logged either way).
+  expectedChainId: bigint | null;
+  /// Contracts that must have code on this chain, by description.
+  contracts: Record<string, string>;
+}
+
+/// Startup sanity check: the RPC is the chain it's configured as, and the configured contracts
+/// actually exist on it. Catches a testnet RPC paired with mainnet addresses (or vice versa), or a
+/// typo'd address, before the relayer acts on them.
+export async function verifyEndpoint(provider: JsonRpcProvider, { label, expectedChainId, contracts }: EndpointCheck): Promise<bigint> {
+  const { chainId } = await provider.getNetwork();
+  if (expectedChainId !== null && chainId !== expectedChainId) {
+    throw new Error(`[${label}] RPC reports chain ID ${chainId}, but it's configured for chain ${expectedChainId} - wrong RPC URL?`);
+  }
+  for (const [what, address] of Object.entries(contracts)) {
+    if ((await provider.getCode(address)) === "0x") {
+      throw new Error(`[${label}] No contract code for ${what} at ${address} on chain ${chainId} - wrong address, or wrong network?`);
+    }
+  }
+  return chainId;
+}
 
 /// How settled a source-chain block must be before deposits in it are paid out: a fixed number of
 /// blocks behind the head, or one of the consensus-backed tags. AssetHub/Ethereum payouts rest

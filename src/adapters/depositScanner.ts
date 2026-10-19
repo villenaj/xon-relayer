@@ -63,6 +63,14 @@ export async function createDepositScanner(context: AdapterContext, source: Depo
 
   console.log(`[${label}] Watching ${source.description}, settling after ${describeConfirmations(source.confirmations)}`);
 
+  // Fail at startup, not on every poll, if this RPC can't serve the confirmation policy (e.g. it
+  // doesn't support the "finalized" tag) - otherwise the adapter would just sit there stalled.
+  try {
+    await getSafeHead(provider, source.confirmations);
+  } catch (err) {
+    throw new Error(`[${label}] Can't find the safe head with ${describeConfirmations(source.confirmations)}: ${describeError(err)}`);
+  }
+
   const checkpointed = checkpoint.load();
   let fromBlock: number;
   if (checkpointed !== null) {

@@ -1,7 +1,8 @@
 import 'dotenv/config';
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { ethers } from "ethers";
-import { parseConfirmations, type Confirmations } from "./chain.js";
+import { DEFAULT_RPC_TIMEOUT_MS, parseConfirmations, type Confirmations } from "./chain.js";
 
 function required(name: string): string {
   const value = process.env[name];
@@ -45,13 +46,59 @@ const optionalUsdt = (name: string) => optionalAmount(name, USDT_DECIMALS, "USDT
 // XON is Xode's native token; its eth-rpc bridge reports balances with 18 decimals.
 const optionalXon = (name: string) => optionalAmount(name, 18, "XON");
 
+function optionalChainId(name: string): bigint | null {
+  const value = process.env[name];
+  if (!value) return null;
+  if (!/^\d+$/.test(value)) throw new Error(`${name} must be a numeric chain ID (got "${value}").`);
+  return BigInt(value);
+}
+
 const checkpointDir = process.env.CHECKPOINT_DIR ?? ".checkpoints";
+
+const KEY_CREDENTIAL = "relayer-key";
+
+/// The relayer's signing key, from the first of these that's set:
+///   1. the systemd credential "relayer-key" ($CREDENTIALS_DIRECTORY/relayer-key) - production,
+///      encrypted at rest via LoadCredentialEncrypted (see systemd/xon-relayer.service);
+///   2. RELAYER_PRIVATE_KEY_FILE - a file holding the key;
+///   3. RELAYER_PRIVATE_KEY - the key itself (development/tests only).
+/// Only things that sign call this (the relayer, settle-held); read-only tools never load the key.
+export function loadRelayerKey(): { key: string; source: string } {
+  const credentialDir = process.env.CREDENTIALS_DIRECTORY;
+  const credentialFile = credentialDir ? path.join(credentialDir, KEY_CREDENTIAL) : null;
+  const candidates: { source: string; read: () => string }[] = [];
+  if (credentialFile && existsSync(credentialFile)) {
+    candidates.push({ source: `systemd credential "${KEY_CREDENTIAL}"`, read: () => readFileSync(credentialFile, "utf8") });
+  }
+  const keyFile = process.env.RELAYER_PRIVATE_KEY_FILE;
+  if (keyFile) candidates.push({ source: `RELAYER_PRIVATE_KEY_FILE (${keyFile})`, read: () => readFileSync(keyFile, "utf8") });
+  const envKey = process.env.RELAYER_PRIVATE_KEY;
+  if (envKey) candidates.push({ source: "RELAYER_PRIVATE_KEY env var", read: () => envKey });
+
+  if (candidates.length === 0) {
+    throw new Error(`No relayer key: load it as the systemd credential "${KEY_CREDENTIAL}", or set RELAYER_PRIVATE_KEY_FILE (or RELAYER_PRIVATE_KEY for development).`);
+  }
+  if (candidates.length > 1) {
+    throw new Error(`Relayer key is set in more than one place (${candidates.map((c) => c.source).join(", ")}) - set exactly one.`);
+  }
+  const [{ source, read }] = candidates;
+  // Keep the key out of anything this process spawns or dumps from here on.
+  delete process.env.RELAYER_PRIVATE_KEY;
+
+  const key = read().trim();
+  // Never echo the value - only say what's wrong with it.
+  if (!/^0x[0-9a-fA-F]{64}$/.test(key)) throw new Error(`The relayer key from ${source} isn't a 0x-prefixed 32-byte hex private key.`);
+  return { key, source };
+}
 
 export const config = {
   // Xode side - every adapter ends up calling settlePurchase/settleExternalPurchase here.
   xodeEthRpc: process.env.XODE_ETH_RPC ?? "http://127.0.0.1:8546",
   vendingAddress: required("VENDING_ADDRESS"),
-  relayerPrivateKey: required("RELAYER_PRIVATE_KEY"),
+  // Optional, but set them in production: the relayer refuses to start if an RPC reports a
+  // different chain, so a testnet RPC can't be paired with mainnet addresses (or vice versa).
+  xodeChainId: optionalChainId("XODE_CHAIN_ID"),
+  rpcTimeoutMs: Number(process.env.RPC_TIMEOUT_MS ?? DEFAULT_RPC_TIMEOUT_MS),
 
   pollIntervalMs: Number(process.env.POLL_INTERVAL_MS ?? 5000),
   // Max blocks per eth_getLogs call - lower it if a provider rejects ranges this large.
@@ -110,6 +157,7 @@ export const config = {
     gatewayAddress: process.env.ASSETHUB_GATEWAY_ADDRESS,
     startBlock: optionalNumber("ASSETHUB_START_BLOCK"),
     confirmations: confirmations("ASSETHUB_CONFIRMATIONS", "finalized"),
+    chainId: optionalChainId("ASSETHUB_CHAIN_ID"),
     checkpointFile: "assethub.json",
   },
 
@@ -120,6 +168,7 @@ export const config = {
     gatewayAddress: process.env.ETH_GATEWAY_ADDRESS,
     startBlock: optionalNumber("ETHEREUM_START_BLOCK"),
     confirmations: confirmations("ETHEREUM_CONFIRMATIONS", "finalized"),
+    chainId: optionalChainId("ETHEREUM_CHAIN_ID"),
     checkpointFile: "ethereum.json",
   },
 };
@@ -133,6 +182,7 @@ export function validateConfig(): void {
     STALL_ALERT_AFTER_MS: config.stallAlertAfterMs,
     MONITOR_INTERVAL_MS: config.monitorIntervalMs,
     SHUTDOWN_TIMEOUT_MS: config.shutdownTimeoutMs,
+    RPC_TIMEOUT_MS: config.rpcTimeoutMs,
   };
   for (const [name, value] of Object.entries(positiveIntegers)) {
     if (!Number.isInteger(value) || value < 1) {
@@ -141,6 +191,14 @@ export function validateConfig(): void {
   }
   if (!Number.isInteger(config.httpPort) || config.httpPort < 0 || config.httpPort > 65535) {
     throw new Error(`HTTP_PORT must be 0 (off) or a port number (got "${process.env.HTTP_PORT}").`);
+  }
+  const addresses = {
+    VENDING_ADDRESS: config.vendingAddress,
+    ASSETHUB_GATEWAY_ADDRESS: config.assetHub.gatewayAddress,
+    ETH_GATEWAY_ADDRESS: config.ethereum.gatewayAddress,
+  };
+  for (const [name, value] of Object.entries(addresses)) {
+    if (value && !ethers.isAddress(value)) throw new Error(`${name} isn't a valid address (got "${value}").`);
   }
   if (config.adapters.assetHub && (!config.assetHub.rpcUrl || !config.assetHub.gatewayAddress)) {
     throw new Error("ENABLE_ASSETHUB_ADAPTER is on but ASSETHUB_EVM_RPC / ASSETHUB_GATEWAY_ADDRESS are not both set.");

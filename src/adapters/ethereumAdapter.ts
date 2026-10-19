@@ -13,6 +13,7 @@ export function runEthereumAdapter(context: AdapterContext): Promise<void> {
     startBlock: config.ethereum.startBlock,
     startBlockName: "ETHEREUM_START_BLOCK",
     confirmations: config.ethereum.confirmations,
+    expectedChainId: config.ethereum.chainId,
     checkpointFile: config.ethereum.checkpointFile,
   });
 }

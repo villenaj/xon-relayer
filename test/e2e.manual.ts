@@ -12,20 +12,28 @@
 //     you don't control, swap this section for funding a depositor from an account you actually
 //     have USDT on.
 //   - An anvil instance standing in for Ethereum: `anvil --port 8546`
-//   - `forge build` run in xode-blockchain/contracts, so the compiled artifacts this script reads
+//   - `forge build` run in xode-blockchain/contracts (a sibling checkout of this repo, or set
+//     CONTRACTS_OUT to its out/ directory), so the compiled artifacts this script reads
 //     (XonVendingMachine, EthUsdtGateway, MockUSDT) exist
 //
-// Usage: npx tsx test/e2e.manual.ts
+// Usage: npm run test:e2e   (CONTRACTS_OUT=/path/to/xode-blockchain/contracts/out if not a sibling)
 
 import { ApiPromise, WsProvider } from "@polkadot/api";
 import { Keyring } from "@polkadot/keyring";
 import { cryptoWaitReady, encodeAddress } from "@polkadot/util-crypto";
 import { ethers } from "ethers";
-import { readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import type { SubmittableExtrinsic } from "@polkadot/api/types";
 import type { KeyringPair } from "@polkadot/keyring/types";
 import { externalDepositId } from "../src/settlement.js";
+
+// This repo, and xode-blockchain's `forge build` output (default: a sibling checkout of it).
+const REPO = fileURLToPath(new URL("..", import.meta.url));
+const CONTRACTS_OUT = process.env.CONTRACTS_OUT ?? path.resolve(REPO, "../xode-blockchain/contracts/out");
 
 const XODE_WS = "ws://127.0.0.1:9977";
 const XODE_ETH_RPC = "http://127.0.0.1:8545";
@@ -43,9 +51,9 @@ function loadArtifact(file: string): ForgeArtifact {
   return JSON.parse(readFileSync(file, "utf8")) as ForgeArtifact;
 }
 
-const VendingArtifact = loadArtifact("/home/jowel/Documents/GitHub/villenaj/xode-blockchain/contracts/out/XonVendingMachine.sol/XonVendingMachine.json");
-const GatewayArtifact = loadArtifact("/home/jowel/Documents/GitHub/villenaj/xode-blockchain/contracts/out/EthUsdtGateway.sol/EthUsdtGateway.json");
-const MockUsdtArtifact = loadArtifact("/home/jowel/Documents/GitHub/villenaj/xode-blockchain/contracts/out/MockUSDT.sol/MockUSDT.json");
+const VendingArtifact = loadArtifact(`${CONTRACTS_OUT}/XonVendingMachine.sol/XonVendingMachine.json`);
+const GatewayArtifact = loadArtifact(`${CONTRACTS_OUT}/EthUsdtGateway.sol/EthUsdtGateway.json`);
+const MockUsdtArtifact = loadArtifact(`${CONTRACTS_OUT}/MockUSDT.sol/MockUSDT.json`);
 
 const ANVIL_DEFAULT_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
@@ -165,11 +173,17 @@ async function main(): Promise<void> {
   console.log("gateway (AssetHub):", ahGatewayAddress);
 
   // --- Start the relayer with all three adapters ---
-  rmSync("/home/jowel/Documents/GitHub/villenaj/xon-relayer/.checkpoints", { recursive: true, force: true });
+  const checkpointDir = mkdtempSync(path.join(tmpdir(), "xon-relayer-test-"));
+  console.log("relayer state (checkpoints, ledger):", checkpointDir);
   const relayerProc = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
-    cwd: "/home/jowel/Documents/GitHub/villenaj/xon-relayer",
+    cwd: REPO,
     env: {
       ...process.env,
+      // Isolate the run: its own checkpoints and ledger, no HTTP port, and none of a developer .env's
+      // production settings (key file, alert webhook, chain IDs, payout caps).
+      CHECKPOINT_DIR: checkpointDir, LEDGER_FILE: path.join(checkpointDir, "ledger.jsonl"), HTTP_PORT: "0",
+      RELAYER_PRIVATE_KEY_FILE: "", CREDENTIALS_DIRECTORY: "", ALERT_WEBHOOK_URL: "",
+      XODE_CHAIN_ID: "", ASSETHUB_CHAIN_ID: "", ETHEREUM_CHAIN_ID: "", MAX_EXTERNAL_DEPOSIT_USDT: "", MAX_EXTERNAL_DAILY_USDT: "",
       XODE_ETH_RPC, VENDING_ADDRESS: vendingAddress, RELAYER_PRIVATE_KEY: relayer.privateKey,
       POLL_INTERVAL_MS: "2000", CONFIRMATIONS: "0", ETHEREUM_CONFIRMATIONS: "0", ASSETHUB_CONFIRMATIONS: "0",
       ENABLE_XODE_ADAPTER: "true", ENABLE_ASSETHUB_ADAPTER: "true", ENABLE_ETHEREUM_ADAPTER: "true",

@@ -16,6 +16,7 @@ export interface ExternalChain {
   confirmations: Confirmations;
   startBlock: number | null;
   checkpointFile: string;
+  chainId: bigint | null;
 }
 
 /// An external source chain's settings by ledger name ("assethub" / "ethereum"), or null if it

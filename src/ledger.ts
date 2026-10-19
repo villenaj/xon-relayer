@@ -3,7 +3,7 @@
 // Settled/ExternalSettled events, this also captures permanently skipped and failed attempts, and
 // the original source-chain tx hash behind each cross-chain depositId.
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 
 export type LedgerStatus =
@@ -48,7 +48,15 @@ export function makeLedger(filePath: string): Ledger {
       try {
         const dir = dirname(filePath);
         if (dir !== "." && !existsSync(dir)) mkdirSync(dir, { recursive: true });
-        appendFileSync(filePath, `${line}\n`);
+        // fsync each entry: a "settled" record lost to a power cut would later show up in
+        // reconcile as an unrecorded payout. Settles are seconds apart, so the cost is nothing.
+        const fd = openSync(filePath, "a");
+        try {
+          writeSync(fd, `${line}\n`);
+          fsyncSync(fd);
+        } finally {
+          closeSync(fd);
+        }
       } catch (err) {
         console.error(`[ledger] Failed to write to ${filePath}, entry was:`, line, err);
       }

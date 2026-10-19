@@ -17,7 +17,7 @@
 import { ethers } from "ethers";
 import type { Log } from "ethers";
 import path from "node:path";
-import { scanLogs } from "../chain.js";
+import { makeProvider, scanLogs, verifyEndpoint } from "../chain.js";
 import { makeCheckpoint } from "../checkpoint.js";
 import { config, USDT_DECIMALS } from "../config.js";
 import { readLedger, type LedgerRecord, type LedgerStatus } from "../ledger.js";
@@ -73,7 +73,8 @@ runTool(async () => {
   const has = (depositId: string, status: LedgerStatus) => (byDeposit.get(key(depositId)) ?? []).some((r) => r.status === status);
   const settledRecord = (depositId: string) => (byDeposit.get(key(depositId)) ?? []).find((r) => r.status === "settled");
 
-  const xode = new ethers.JsonRpcProvider(config.xodeEthRpc);
+  const xode = makeProvider(config.xodeEthRpc, config.rpcTimeoutMs);
+  await verifyEndpoint(xode, { label: "xode", expectedChainId: config.xodeChainId, contracts: { XonVendingMachine: config.vendingAddress } });
   const vending = new ethers.Contract(config.vendingAddress, VENDING_ABI, xode);
   const vendingAddress = await vending.getAddress();
   console.log(`Ledger: ${config.ledgerFile} (${records.length} entries). Vending contract: ${vendingAddress}\n`);
@@ -161,7 +162,8 @@ runTool(async () => {
 
   // AssetHub / Ethereum: Deposited events on each gateway.
   for (const chain of externalChains(config)) {
-    const provider = new ethers.JsonRpcProvider(chain.rpcUrl);
+    const provider = makeProvider(chain.rpcUrl, config.rpcTimeoutMs);
+    await verifyEndpoint(provider, { label: chain.name, expectedChainId: chain.chainId, contracts: { UsdtGateway: chain.gatewayAddress } });
     const gateway = new ethers.Contract(chain.gatewayAddress, GATEWAY_ABI, provider);
     const gatewayAddress = await gateway.getAddress();
     const to = checkpointedUpTo(chain.checkpointFile, gatewayAddress, chain.name);

@@ -7,8 +7,8 @@
 // Usage: npm run settle-held -- <source tx hash>
 
 import { ethers } from "ethers";
-import { getSafeHead } from "../chain.js";
-import { config, USDT_DECIMALS } from "../config.js";
+import { getSafeHead, makeProvider, verifyEndpoint } from "../chain.js";
+import { config, loadRelayerKey, USDT_DECIMALS } from "../config.js";
 import { describeError } from "../errorClassifier.js";
 import { makeLedger, readLedger } from "../ledger.js";
 import { createSettlementClient, externalDepositId } from "../settlement.js";
@@ -33,7 +33,8 @@ async function main(): Promise<void> {
   if (!chain) throw new Error(`No RPC/gateway configured for source chain "${held.sourceChain}".`);
 
   // Re-derive the deposit from the source chain rather than trusting the ledger file.
-  const provider = new ethers.JsonRpcProvider(chain.rpcUrl);
+  const provider = makeProvider(chain.rpcUrl, config.rpcTimeoutMs);
+  await verifyEndpoint(provider, { label: chain.name, expectedChainId: chain.chainId, contracts: { UsdtGateway: chain.gatewayAddress } });
   const gateway = new ethers.Contract(chain.gatewayAddress, GATEWAY_ABI, provider);
   const gatewayAddress = (await gateway.getAddress()).toLowerCase();
   const receipt = await provider.getTransactionReceipt(sourceTxHash);
@@ -56,7 +57,9 @@ async function main(): Promise<void> {
   const settlement = await createSettlementClient({
     xodeEthRpc: config.xodeEthRpc,
     vendingAddress: config.vendingAddress,
-    relayerPrivateKey: config.relayerPrivateKey,
+    relayerPrivateKey: loadRelayerKey().key,
+    expectedChainId: config.xodeChainId,
+    rpcTimeoutMs: config.rpcTimeoutMs,
   });
   const ledger = makeLedger(config.ledgerFile);
   const entry = {

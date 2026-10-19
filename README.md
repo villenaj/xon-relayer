@@ -99,7 +99,7 @@ bound how much it will pay out automatically:
   `settle-held` count toward it from the next restart.
 
 The relayer logs a warning at startup if both are unset. These caps live in the relayer, so they
-guard against relayer bugs and bad deposits, not a stolen `RELAYER_PRIVATE_KEY` - that needs
+guard against relayer bugs and bad deposits, not a stolen relayer key - that needs
 equivalent caps enforced in `XonVendingMachine` itself.
 
 ## Transaction ledger
@@ -167,16 +167,16 @@ finds a problem, so it can run from cron:
 Held deposits and skipped deposits still awaiting a refund are listed as notes, not problems.
 Each chain is scanned from its configured start block, or else the earliest block the ledger
 mentions for it, up to its adapter's checkpoint. Override with `--xode-from`, `--assethub-from` or
-`--ethereum-from <block>`. Example cron entry for the service user, loading the same env file as
-the systemd unit and alerting only on failure:
+`--ethereum-from <block>`. Example root cron entry, alerting only on failure:
 
 ```cron
-0 6 * * * cd /opt/xon-relayer && set -a && . /etc/xon-relayer.env && node dist/tools/reconcile.js > /var/log/xon-reconcile.log 2>&1 || <your alert command>
+0 6 * * * /opt/xon-relayer/systemd/xon-relayer-cmd reconcile > /var/log/xon-reconcile.log 2>&1 || <your alert command>
 ```
 
 The operator commands (`settle-held`, `refunds`, `reconcile`) read the same configuration as the
-relayer, so they need those variables too - from `.env` in the working directory, or the env file
-loaded as above.
+relayer. On a server, run them through `systemd/xon-relayer-cmd` (see Running on a server), which
+gives them the service's settings, state directory and key credential. Locally, they read `.env`.
+Only `settle-held` signs anything, so only it loads the relayer key.
 
 ## Health, metrics and alerts
 
@@ -214,12 +214,100 @@ start. The systemd unit's `TimeoutStopSec=150` leaves room for the default timeo
 
 ## Running on a server
 
-See `systemd/xon-relayer.service` for an example unit file. Key points:
+`systemd/xon-relayer.service` is the production unit: a dedicated no-login user, a hardened
+sandbox (read-only filesystem apart from its state directory, no privilege escalation, restricted
+syscalls), state in `/var/lib/xon-relayer`, and the key from an encrypted systemd credential.
 
-- Put secrets (`RELAYER_PRIVATE_KEY` etc.) in an `EnvironmentFile` readable only by the service
-  account (`chmod 600`, owned by that user) - never inline in the unit file or command line.
-- Run under a dedicated, no-login service user.
-- `CHECKPOINT_DIR` should point somewhere persistent and writable by that user.
-- The unit runs the compiled `dist/index.js`, so run `npm run build` as part of each deploy.
-- Point your monitoring at `/health` (or scrape `/metrics`) and set `ALERT_WEBHOOK_URL` and the
-  `MIN_*_XON` thresholds - otherwise nobody hears about a stalled adapter or a draining reserve.
+### First deploy
+
+```bash
+# 1. Service user and code (Node 20.10+; Node 22 recommended)
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin xonrelayer
+sudo git clone <this repo> /opt/xon-relayer && cd /opt/xon-relayer
+sudo npm ci && sudo npm run build
+
+# 2. Settings: copy .env.example, fill it in, and DELETE the RELAYER_PRIVATE_KEY line.
+#    Set XODE_CHAIN_ID / ASSETHUB_CHAIN_ID / ETHEREUM_CHAIN_ID, the payout caps, the MIN_*_XON
+#    thresholds and ALERT_WEBHOOK_URL. Don't set CHECKPOINT_DIR (the unit sets it).
+sudo install -m 600 -o root -g root .env.example /etc/xon-relayer.env && sudoedit /etc/xon-relayer.env
+
+# 3. The relayer key, encrypted at rest (paste the 0x... key, then Ctrl-D). It never touches disk
+#    in plain text, and isn't visible in the environment or process list.
+sudo mkdir -p /etc/xon-relayer
+sudo systemd-creds encrypt --name=relayer-key - /etc/xon-relayer/relayer-key.cred
+
+# 4. Install and start
+sudo cp systemd/xon-relayer.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now xon-relayer
+journalctl -u xon-relayer -f
+```
+
+`LoadCredentialEncrypted` needs systemd 250+ (Ubuntu 24.04, Debian 12). On older systemd, keep
+the key in a root-only file (`install -m 600 /dev/stdin /etc/xon-relayer/relayer-key`) and replace
+that line in the unit and in `systemd/xon-relayer-cmd` with
+`LoadCredential=relayer-key:/etc/xon-relayer/relayer-key`. The key is then plaintext at rest, but
+still only readable by root and the service.
+
+At startup the relayer refuses to run if:
+- another relayer is already running against the same state directory;
+- an RPC reports a different chain ID than configured, or a configured contract has no code;
+- a chain's RPC can't serve its confirmation setting (e.g. no `finalized` tag);
+- the key doesn't match the vending contract's `relayer`.
+
+### Deploying an update
+
+```bash
+cd /opt/xon-relayer && sudo git pull && sudo npm ci && sudo npm test && sudo npm run build
+sudo systemctl restart xon-relayer   # graceful: finishes in-flight settles first
+```
+
+### Operator commands
+
+```bash
+sudo /opt/xon-relayer/systemd/xon-relayer-cmd reconcile
+sudo /opt/xon-relayer/systemd/xon-relayer-cmd refunds -- --all
+sudo /opt/xon-relayer/systemd/xon-relayer-cmd settle-held 0x<source tx hash>
+```
+
+These run as the service user with the service's settings and key, via `systemd-run`.
+
+### Checklist
+
+- Back up `/var/lib/xon-relayer` (the ledger is the audit trail; checkpoints let it resume).
+- Point external monitoring at `/health` - it also catches the process being down entirely, which
+  the relayer's own alerts can't.
+- Run exactly one relayer per relayer key. The lock file stops a second one on the same machine,
+  but not on another machine.
+- Schedule `reconcile` daily (see Reconciliation).
+
+## Runbook
+
+**Unrecorded payout (reconcile) - treat as a key compromise until proven otherwise.**
+1. Pause `XonVendingMachine` with the owner key so nothing more can be paid out.
+2. Stop the relayer: `systemctl stop xon-relayer`.
+3. Rotate the key. Generate a new one, run `setRelayer(newAddress)` with the owner key, and
+   re-encrypt the credential (step 3 of First deploy).
+4. Investigate the payout in the ledger and on-chain, then unpause and restart.
+
+**Adapter stalled (alert, or `/health` returns 503).** Check `journalctl -u xon-relayer`.
+- Repeated "Failed to settle": the error name says why. `IsPaused` means the contract is paused;
+  `InsufficientReserve` means it needs more XON; `NotRelayer` means the key and contract disagree.
+- "Poll tick failed": the RPC is down or rate-limited.
+- "24h payout cap reached": intended. It resumes by itself, or raise `MAX_EXTERNAL_DAILY_USDT`
+  and restart.
+
+**Low balance (alert).** Top up the relayer address with XON for gas, or fund the vending contract's
+reserve. Settles that failed meanwhile are retried automatically.
+
+**Held deposit (alert).** Check the deposit on the source chain, then run
+`xon-relayer-cmd settle-held <tx>`, or refund the depositor if it shouldn't be paid.
+
+**Skipped deposit / missed deposit (reconcile).** For skipped deposits, follow
+`xon-relayer-cmd refunds`. A missed deposit means a deposit sits behind a checkpoint unpaid, which
+shouldn't happen. Check the ledger and logs around its block. To reprocess it, stop the relayer,
+set that adapter's checkpoint value (`/var/lib/xon-relayer/<chain>.json`) to the block, and start
+again. Already-settled deposits are skipped, so this is safe.
+
+**Relayer won't start, "Another relayer is already running".** Find the other process
+(`systemctl status xon-relayer`, `ps`). Only delete `/var/lib/xon-relayer/relayer.lock` once you're
+sure nothing else is running.

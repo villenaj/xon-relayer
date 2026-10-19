@@ -6,13 +6,53 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=xonrelayer
+Group=xonrelayer
 WorkingDirectory=/opt/xon-relayer
-EnvironmentFile=/etc/xon-relayer.env
 ExecStart=/usr/bin/node dist/index.js
+
+# Non-secret settings only. The relayer key does NOT go in here - see LoadCredentialEncrypted.
+EnvironmentFile=/etc/xon-relayer.env
+
+# Checkpoints and the ledger live in /var/lib/xon-relayer, created and owned by systemd for this
+# user. (Don't set CHECKPOINT_DIR in the env file - it would override this.) Back this directory up.
+StateDirectory=xon-relayer
+StateDirectoryMode=0700
+Environment=CHECKPOINT_DIR=/var/lib/xon-relayer
+
+# The relayer key, encrypted at rest with systemd-creds (bound to this host's key / TPM). systemd
+# decrypts it into a private in-memory $CREDENTIALS_DIRECTORY only this service can read. Needs
+# systemd >= 250 (Ubuntu 24.04, Debian 12) - on older systemd, see the README for the fallback.
+# Create it with:  systemd-creds encrypt --name=relayer-key - /etc/xon-relayer/relayer-key.cred
+LoadCredentialEncrypted=relayer-key:/etc/xon-relayer/relayer-key.cred
+
 Restart=always
-RestartSec=5
+RestartSec=10
 # Give in-flight settles time to finish on stop - keep above SHUTDOWN_TIMEOUT_MS (default 120s).
 TimeoutStopSec=150
+
+# Hardening: the relayer only needs network access and its state directory.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+UMask=0077
+# (MemoryDenyWriteExecute is deliberately not set - it breaks Node's JIT.)
 
 [Install]
 WantedBy=multi-user.target
