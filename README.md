@@ -255,11 +255,20 @@ sudo systemctl daemon-reload && sudo systemctl enable --now xon-relayer
 journalctl -u xon-relayer -f
 ```
 
-`LoadCredentialEncrypted` needs systemd 250+ (Ubuntu 24.04, Debian 12). On older systemd, keep
-the key in a root-only file (`install -m 600 /dev/stdin /etc/xon-relayer/relayer-key`) and replace
-that line in the unit and in `systemd/xon-relayer-cmd` with
-`LoadCredential=relayer-key:/etc/xon-relayer/relayer-key`. The key is then plaintext at rest, but
-still only readable by root and the service.
+`LoadCredentialEncrypted` needs systemd 250+ (Ubuntu 24.04, Debian 12; check with
+`systemctl --version`). On older systemd, such as Ubuntu 22.04's 249, keep the key in a root-only
+file and point the service at it with a drop-in, instead of step 3:
+
+```bash
+sudo mkdir -p /etc/xon-relayer
+sudo install -m 600 -o root -g root /dev/stdin /etc/xon-relayer/relayer-key   # paste the key, Ctrl-D
+sudo systemctl edit xon-relayer   # add the two lines below, save
+#   [Service]
+#   LoadCredential=relayer-key:/etc/xon-relayer/relayer-key
+```
+
+`systemd/xon-relayer-cmd` picks up whichever key file exists. The key is then plaintext at rest,
+but still only readable by root and the service.
 
 At startup the relayer refuses to run if:
 - another relayer is already running against the same state directory;

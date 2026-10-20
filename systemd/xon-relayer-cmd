@@ -18,10 +18,18 @@ esac
 shift
 [ "${1:-}" = "--" ] && shift
 
+# The key as the service gets it: encrypted (systemd 250+), or the root-only plaintext file used on
+# older systemd such as Ubuntu 22.04's (see README).
+if [ -f /etc/xon-relayer/relayer-key.cred ]; then
+  credential="LoadCredentialEncrypted=relayer-key:/etc/xon-relayer/relayer-key.cred"
+else
+  credential="LoadCredential=relayer-key:/etc/xon-relayer/relayer-key"
+fi
+
 exec systemd-run --quiet --pipe --wait --collect \
   -p User=xonrelayer -p Group=xonrelayer \
   -p WorkingDirectory=/opt/xon-relayer \
   -p EnvironmentFile=/etc/xon-relayer.env \
   -p Environment=CHECKPOINT_DIR=/var/lib/xon-relayer \
-  -p LoadCredentialEncrypted=relayer-key:/etc/xon-relayer/relayer-key.cred \
+  -p "$credential" \
   /usr/bin/node "dist/tools/$script.js" "$@"
