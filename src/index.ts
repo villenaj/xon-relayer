@@ -107,7 +107,7 @@ async function main(): Promise<void> {
 async function checkOnChainLimits(settlement: SettlementClient, relayerPerDeposit: bigint | null, relayerPer24h: bigint | null): Promise<void> {
   const limits = await settlement.externalLimits();
   if (!limits) {
-    console.warn("XonVendingMachine has no on-chain limits on external payouts (an older deployment) - a stolen relayer key could drain its whole reserve. See the redeploy steps in the xode-blockchain runbook.");
+    console.warn("XonVendingMachine has no on-chain limits on external payouts (an older deployment) - a stolen relayer key could drain its whole reserve. See the redeploy steps in the contracts repo runbook (docs/xon-vending-runbook.md).");
     return;
   }
   const usdt = (v: bigint) => `${ethers.formatUnits(v, USDT_DECIMALS)} USDT`;
