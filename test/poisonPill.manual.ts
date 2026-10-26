@@ -19,12 +19,12 @@ import { spawn } from "node:child_process";
 import type { SubmittableExtrinsic } from "@polkadot/api/types";
 import type { KeyringPair } from "@polkadot/keyring/types";
 
-// This repo, and xode-blockchain's `forge build` output (default: a sibling checkout of it).
+// This repo, and contracts' `forge build` output (default: a sibling checkout of it).
 const REPO = fileURLToPath(new URL("..", import.meta.url));
-const CONTRACTS_OUT = process.env.CONTRACTS_OUT ?? path.resolve(REPO, "../xode-blockchain/contracts/out");
+const CONTRACTS_OUT = process.env.CONTRACTS_OUT ?? path.resolve(REPO, "../contracts/out");
 
 const XODE_WS = "ws://127.0.0.1:9977";
-const XODE_ETH_RPC = "http://127.0.0.1:8545";
+const XODE_ETH_RPC = "http://127.0.0.1:8546";
 const UNIT = 1_000_000_000_000n;
 const USDT_DECIMALS = 6;
 

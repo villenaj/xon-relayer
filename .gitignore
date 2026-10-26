@@ -3,3 +3,5 @@ node_modules/
 .checkpoints/
 *.log
 dist/
+setup.env
+setup.out.env

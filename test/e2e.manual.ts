@@ -12,11 +12,11 @@
 //     you don't control, swap this section for funding a depositor from an account you actually
 //     have USDT on.
 //   - An anvil instance standing in for Ethereum: `anvil --port 8546`
-//   - `forge build` run in xode-blockchain/contracts (a sibling checkout of this repo, or set
+//   - `forge build` run in contracts (a sibling checkout of this repo, or set
 //     CONTRACTS_OUT to its out/ directory), so the compiled artifacts this script reads
 //     (XonVendingMachine, EthUsdtGateway, MockUSDT) exist
 //
-// Usage: npm run test:e2e   (CONTRACTS_OUT=/path/to/xode-blockchain/contracts/out if not a sibling)
+// Usage: npm run test:e2e   (CONTRACTS_OUT=/path/to/contracts/out if not a sibling)
 
 import { ApiPromise, WsProvider } from "@polkadot/api";
 import { Keyring } from "@polkadot/keyring";
@@ -31,15 +31,15 @@ import type { SubmittableExtrinsic } from "@polkadot/api/types";
 import type { KeyringPair } from "@polkadot/keyring/types";
 import { externalDepositId } from "../src/settlement.js";
 
-// This repo, and xode-blockchain's `forge build` output (default: a sibling checkout of it).
+// This repo, and contracts' `forge build` output (default: a sibling checkout of it).
 const REPO = fileURLToPath(new URL("..", import.meta.url));
-const CONTRACTS_OUT = process.env.CONTRACTS_OUT ?? path.resolve(REPO, "../xode-blockchain/contracts/out");
+const CONTRACTS_OUT = process.env.CONTRACTS_OUT ?? path.resolve(REPO, "../contracts/out");
 
 const XODE_WS = "ws://127.0.0.1:9977";
-const XODE_ETH_RPC = "http://127.0.0.1:8545";
-const ASSETHUB_WS = process.env.ASSETHUB_WS ?? "ws://127.0.0.1:9955";
+const XODE_ETH_RPC = "http://127.0.0.1:8546";
+const ASSETHUB_WS = process.env.ASSETHUB_WS ?? "ws://127.0.0.1:9966";
 const ASSETHUB_EVM_RPC = process.env.ASSETHUB_EVM_RPC ?? "http://127.0.0.1:8547";
-const ANVIL_RPC = "http://127.0.0.1:8546";
+const ANVIL_RPC = "http://127.0.0.1:8545";
 const UNIT = 1_000_000_000_000n;
 const USDT_DECIMALS = 6;
 

@@ -21,7 +21,7 @@ since the USDT there never touches the contract's own balance and can't be indep
 from Xode. Securing the relayer's private key (and, for the AssetHub/Ethereum legs, the deployed
 gateway contract's owner key that can withdraw its custodied USDT) is the actual security boundary
 for those two paths - see the contract-level comments in `XonVendingMachine.sol` and
-`EthUsdtGateway.sol` in the `xode-blockchain` repo.
+`EthUsdtGateway.sol` in the `contracts` repo.
 
 Both the Ethereum and AssetHub legs are really the same adapter (`src/adapters/evmGatewayAdapter.ts`)
 called with different chain config - `ethereumAdapter.ts` and `assetHubAdapter.ts` are thin wrappers
@@ -39,7 +39,21 @@ npm start              # node dist/index.js
 ```
 
 For development, `npm run dev` runs `src/index.ts` directly via `tsx` (no build step), and
-`npm run typecheck` type-checks both `src/` and `test/`.
+`npm run typecheck` type-checks `src/`, `test/` and `scripts/`.
+
+### Dev/test chain setup
+
+`npm run setup` (`scripts/setup.ts`) prepares a dev or test environment in one go. It creates the
+USDT asset on Xode and AssetHub, deploys XonVendingMachine and both gateways, funds every account
+and contract, and writes the relayer settings to `setup.out.env`. Two accounts run all of it: one
+Substrate **asset owner** used on both Xode and AssetHub, and one EVM **contract owner**. The
+relayer uses the contract owner's key unless you set `RELAYER_PRIVATE_KEY`. You can run it again
+safely. Settings are in `setup.env.example`.
+
+Using one key for the owner and the relayer is fine on dev and test chains, but not in production.
+The relayer key sits on the server, and the owner key can withdraw the whole XON reserve, lift the
+payout caps and drain the gateways. With one key, anyone who steals the relayer key gets all of
+that, and the payout caps no longer limit the loss.
 
 ## Tests
 
