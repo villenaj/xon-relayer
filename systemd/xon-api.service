@@ -1,0 +1,46 @@
+[Unit]
+Description=XON front-end API (keyless - builds unsigned txs, reads balances and deposit status)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Same user as the relayer so it can read the ledger in /var/lib/xon-relayer. It never gets the
+# relayer key: that credential is only loaded into xon-relayer.service.
+User=xonrelayer
+Group=xonrelayer
+WorkingDirectory=/opt/xon-relayer
+ExecStart=/usr/bin/node dist/api/index.js
+
+# Shares the relayer's settings. Set API_HOST / API_PORT / API_CORS_ORIGINS there.
+EnvironmentFile=/etc/xon-relayer.env
+Environment=CHECKPOINT_DIR=/var/lib/xon-relayer
+
+Restart=always
+RestartSec=5
+
+# Hardening: network access and read-only access to the relayer's state.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -363,6 +363,21 @@ At startup the relayer refuses to run if:
 - a chain's RPC can't serve its confirmation setting (e.g. no `finalized` tag);
 - the key doesn't match the vending contract's `relayer`.
 
+### Front-end API service
+
+`systemd/xon-api.service` runs the front-end API next to the relayer. It uses the same settings
+file and reads the relayer's ledger, but never gets the key:
+
+```bash
+sudo cp systemd/xon-api.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now xon-api
+curl http://127.0.0.1:8080/api/health
+```
+
+It listens on localhost only. Reach it through an SSH tunnel, or put a TLS reverse proxy in front
+of it (set `API_CORS_ORIGINS` in `/etc/xon-relayer.env` to the UI's origin). After an update,
+restart it along with the relayer.
+
 ### Deploying an update
 
 ```bash
