@@ -61,7 +61,8 @@ that, and the payout caps no longer limit the loss.
   They cover the deposit loop (ordering, stalling on transient failures, skipping permanent ones,
   checkpoint resume, payout-cap gating, shutdown), stuck-tx recovery (nonce resets, fee-bumped
   replacements, revert-reason replay), error classification, payout caps, checkpoints, the
-  ledger, chunked log scanning, health/metrics and shutdown.
+  ledger, chunked log scanning, health/metrics, shutdown, and the front-end API (transaction
+  building, deposit parsing, routing, CORS, event streams).
 - `npm run test:e2e`, `test:multi-buyer`, `test:poison-pill` - manual end-to-end tests against a
   local zombienet / anvil (see each file's header for the setup they need).
 
@@ -230,6 +231,78 @@ once when something goes wrong and once when it recovers:
 
 Alerts are always logged; set `ALERT_WEBHOOK_URL` to also POST them to a chat webhook. The body
 carries the message as both `text` (Slack, Mattermost, Google Chat) and `content` (Discord).
+
+## Front-end API
+
+`npm run api` (`npm run dev:api` in development) starts a JSON API for a buyer-facing UI, on
+`http://127.0.0.1:8080` (`API_HOST` / `API_PORT`). It's a separate process from the relayer and
+never loads the relayer key. It doesn't hold buyers' keys either: it works out which transactions
+a purchase needs and returns them unsigned, the buyer's wallet signs and sends them, and the API
+then reports their progress. It reads the same configuration as the relayer, and the relayer's
+ledger (if it's on the same host) for held, skipped and refunded deposits and for purchase history.
+
+Browsers can only call it from the origins in `API_CORS_ORIGINS` (comma-separated, or `*`). To
+expose it, put it behind a TLS reverse proxy that also rate-limits it. Amounts in requests are USDT
+strings like `"12.5"`. Amounts in responses are `{ "raw": "12500000", "formatted": "12.5" }`. Errors
+are `{ "error": "<Code>", "message": "..." }` with a 4xx status, or 502 when a chain RPC fails.
+
+| Endpoint | What it does |
+| --- | --- |
+| `GET /api/config` | Networks (chain ID, USDT address, the contract USDT is paid into, `flow`: `transfer` or `approve-deposit`), the XON rate, and the external payout limits. Call it once at startup. |
+| `GET /api/limits` | The vending contract's XON reserve, and the on-chain and relayer payout limits, including how much of today's allowance is left. |
+| `GET /api/quote?amount=10&network=ethereum` | XON for that much USDT, plus `warnings` if the payout would be delayed or held for review. |
+| `GET /api/balances/:address?networks=xode,ethereum` | Native and USDT balance on each network, and the gateway allowance where one is needed. |
+| `GET /api/allowance/:network/:address` | How much USDT the gateway may take from the address. |
+| `POST /api/tx/buy` | `{ network, from, amount, beneficiary? }` returns every transaction the purchase needs, in order: one USDT transfer on Xode, or approve (if needed) then deposit elsewhere. `beneficiary` (default `from`) is who gets the XON. On Xode it's always the sender. |
+| `POST /api/tx/approve` | `{ network, from, amount }` returns only the approval (`amount: "max"` for unlimited). On Ethereum, a non-zero allowance is reset to 0 first, because USDT there requires it. |
+| `POST /api/tx/deposit` | `{ network, from, amount, beneficiary? }` returns only the gateway deposit. It refuses if the allowance or balance is too low. |
+| `POST /api/tx/broadcast` | `{ network, signedTx }` sends a transaction the wallet signed but didn't send. It only accepts transactions to that network's USDT or gateway/vending contract. |
+| `GET /api/tx/:network/:hash` | The receipt, confirmation status and, for a purchase, each deposit's state and payout tx. |
+| `GET /api/tx/:network/:hash/events` | Event stream following the transaction until it's done (see below). |
+| `GET /api/watch/:address[,address2...]?networks=` | Event stream for an address (block scanner, see below). |
+| `GET /api/deposits/:address` | Purchase history for an XON recipient, from the ledger. |
+| `GET /api/health` | Each chain's head block, the number of open streams, and the relayer's own `/health`. |
+
+`buy`, `approve` and `deposit` refuse amounts the wallet doesn't have, and amounts that would round
+to 0 XON (never payable). Each step's `tx` (`from`, `to`, `data`, `value`, `chainId`) goes straight
+to `eth_sendTransaction`. Switch the wallet to `chainId` first (`wallet_switchEthereumChain`), and
+send the steps in order, waiting for each to be mined.
+
+A deposit's `state` is one of `awaiting-confirmations` (mined, not yet past the chain's
+confirmation setting), `settling` (waiting for the relayer), `settled`, `held` (over a payout limit,
+waiting for an operator), `skipped` (can never be paid, so the USDT is owed back) or `refunded`.
+Whether a deposit is paid comes from the vending contract itself. The other states come from the
+ledger, so without the ledger a held or skipped deposit shows as `settling`.
+
+**Event streams** are [Server-Sent Events](https://developer.mozilla.org/docs/Web/API/EventSource),
+so a browser `EventSource` reads them. At most `API_MAX_STREAMS` (default 500) can be open at once:
+
+- `/api/tx/:network/:hash/events` sends `status` (the same body as `GET /api/tx/...`) whenever
+  something changes, `payout` (settle tx and XON amount) as each deposit is paid, then `done` and
+  closes. It also stops if a deposit is held, or with `timeout` after an hour.
+- `/api/watch/:address` scans each new block from now on (up to 20 addresses per stream). It sends
+  `transaction` (with the receipt) for every tx from or to the address, `usdt-received` for incoming
+  USDT, `xon-payout` when the address is paid XON, and `block` as each block is scanned. Events are
+  sent at the chain head, before confirmation. After a reorg the same tx can come again from its new
+  block, so dedupe by hash.
+
+```js
+const api = "https://api.example.com";
+const { steps } = await (await fetch(`${api}/api/tx/buy`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ network: "ethereum", from: account, amount: "25" }),
+})).json();
+await ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: steps[0].tx.chainId }] });
+let hash;
+for (const { tx } of steps) {
+  hash = await ethereum.request({ method: "eth_sendTransaction", params: [tx] });
+  await waitForReceipt(hash); // e.g. poll GET /api/tx/ethereum/:hash until state is "mined"
+}
+const events = new EventSource(`${api}/api/tx/ethereum/${hash}/events`);
+events.addEventListener("payout", (e) => console.log("XON paid:", JSON.parse(e.data)));
+events.addEventListener("done", () => events.close());
+```
 
 ## Shutdown
 

@@ -13,6 +13,8 @@
     "test": "node --import tsx --test \"test/unit/*.test.ts\"",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
+    "api": "node dist/api/index.js",
+    "dev:api": "tsx src/api/index.ts",
     "settle-held": "node dist/tools/settleHeld.js",
     "refunds": "node dist/tools/refunds.js",
     "reconcile": "node dist/tools/reconcile.js",

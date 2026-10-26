@@ -142,6 +142,18 @@ export const config = {
   // Optional chat webhook (Slack/Discord/Mattermost-style) that alerts are POSTed to.
   alertWebhookUrl: process.env.ALERT_WEBHOOK_URL || null,
 
+  // Front-end API (`npm run api`, see src/api/) - a separate, keyless process: it builds unsigned
+  // transactions for the buyer's wallet to sign and reads chain state, but never signs anything.
+  // Bound to localhost by default - put it behind a TLS reverse proxy to expose it.
+  apiHost: process.env.API_HOST ?? "127.0.0.1",
+  apiPort: Number(process.env.API_PORT ?? 8080),
+  // Origins allowed to call the API from a browser (comma-separated, or "*"). Empty allows none.
+  apiCorsOrigins: (process.env.API_CORS_ORIGINS ?? "").split(",").map((o) => o.trim()).filter(Boolean),
+  // Cap on open event streams (tx waits + address watches) across all clients.
+  apiMaxStreams: Number(process.env.API_MAX_STREAMS ?? 500),
+  // How often the API's block scanner polls each chain while someone is subscribed.
+  apiPollIntervalMs: Number(process.env.API_POLL_INTERVAL_MS ?? 3000),
+
   // How long to let in-flight settles finish after SIGTERM/SIGINT before exiting anyway. Keep
   // systemd's TimeoutStopSec above this.
   shutdownTimeoutMs: Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 120_000),
@@ -163,6 +175,8 @@ export const config = {
     confirmations: confirmations("ASSETHUB_CONFIRMATIONS", "finalized"),
     chainId: optionalChainId("ASSETHUB_CHAIN_ID"),
     checkpointFile: "assethub.json",
+    // Only for display by the front-end API - its eth-rpc bridge reports balances with 18 decimals.
+    nativeSymbol: process.env.ASSETHUB_NATIVE_SYMBOL ?? "DOT",
   },
 
   // Ethereum adapter - watches UsdtGateway.Deposited on the actual Ethereum network (or any
@@ -174,6 +188,7 @@ export const config = {
     confirmations: confirmations("ETHEREUM_CONFIRMATIONS", "finalized"),
     chainId: optionalChainId("ETHEREUM_CHAIN_ID"),
     checkpointFile: "ethereum.json",
+    nativeSymbol: process.env.ETHEREUM_NATIVE_SYMBOL ?? "ETH",
   },
 };
 
@@ -187,6 +202,8 @@ export function validateConfig(): void {
     MONITOR_INTERVAL_MS: config.monitorIntervalMs,
     SHUTDOWN_TIMEOUT_MS: config.shutdownTimeoutMs,
     RPC_TIMEOUT_MS: config.rpcTimeoutMs,
+    API_MAX_STREAMS: config.apiMaxStreams,
+    API_POLL_INTERVAL_MS: config.apiPollIntervalMs,
   };
   for (const [name, value] of Object.entries(positiveIntegers)) {
     if (!Number.isInteger(value) || value < 1) {
@@ -195,6 +212,9 @@ export function validateConfig(): void {
   }
   if (!Number.isInteger(config.httpPort) || config.httpPort < 0 || config.httpPort > 65535) {
     throw new Error(`HTTP_PORT must be 0 (off) or a port number (got "${process.env.HTTP_PORT}").`);
+  }
+  if (!Number.isInteger(config.apiPort) || config.apiPort < 1 || config.apiPort > 65535) {
+    throw new Error(`API_PORT must be a port number (got "${process.env.API_PORT}").`);
   }
   const addresses = {
     VENDING_ADDRESS: config.vendingAddress,
