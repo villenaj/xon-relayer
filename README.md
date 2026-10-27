@@ -262,6 +262,7 @@ are `{ "error": "<Code>", "message": "..." }` with a 4xx status, or 502 when a c
 | `GET /api/watch/:address[,address2...]?networks=` | Event stream for an address (block scanner, see below). |
 | `GET /api/deposits/:address` | Purchase history for an XON recipient, from the ledger. |
 | `GET /api/health` | Each chain's head block, the number of open streams, and the relayer's own `/health`. |
+| `GET /api/docs` | Swagger UI for all of the above. It loads from a CDN, so the browser needs internet access. The OpenAPI spec itself is at `GET /api/openapi.json`. |
 
 `buy`, `approve` and `deposit` refuse amounts the wallet doesn't have, and amounts that would round
 to 0 XON (never payable). Each step's `tx` (`from`, `to`, `data`, `value`, `chainId`) goes straight

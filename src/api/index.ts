@@ -6,6 +6,7 @@
 import { config, validateConfig } from "../config.js";
 import { ApiError, listen, makeHandler, StreamRegistry, type Route } from "./http.js";
 import { connectNetworks } from "./networks.js";
+import { openApiSpec, swaggerHtml } from "./openapi.js";
 import { followTx, makeScanners } from "./scanner.js";
 import { makeApiService } from "./service.js";
 import { parseAddress } from "./transactions.js";
@@ -50,6 +51,13 @@ async function main(): Promise<void> {
           }
         }));
         return { status: "ok", networks: Object.fromEntries(heads), openStreams: streams.size, relayer: await relayerHealth() };
+      },
+    },
+    { method: "GET", path: "/api/openapi.json", handler: async () => openApiSpec },
+    {
+      method: "GET", path: "/api/docs", handler: async ({ res }) => {
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }).end(swaggerHtml);
+        return undefined;
       },
     },
     { method: "GET", path: "/api/config", handler: () => service.info() },
