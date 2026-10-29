@@ -198,12 +198,12 @@ mentions for it, up to its adapter's checkpoint. Override with `--xode-from`, `-
 `--ethereum-from <block>`. Example root cron entry, alerting only on failure:
 
 ```cron
-0 6 * * * /opt/xon-relayer/systemd/xon-relayer-cmd reconcile > /var/log/xon-reconcile.log 2>&1 || <your alert command>
+0 6 * * * /opt/xon-relayer/docker/xon-relayer-cmd reconcile > /var/log/xon-reconcile.log 2>&1 || <your alert command>
 ```
 
 The operator commands (`settle-held`, `refunds`, `reconcile`) read the same configuration as the
-relayer. On a server, run them through `systemd/xon-relayer-cmd` (see Running on a server), which
-gives them the service's settings, state directory and key credential. Locally, they read `.env`.
+relayer. On a server, run them through `docker/xon-relayer-cmd` (see Running on a server), which
+gives them the relayer container's settings, state directory and key. Locally, they read `.env`.
 Only `settle-held` signs anything, so only it loads the relayer key.
 
 ## Health, metrics and alerts
@@ -307,56 +307,52 @@ events.addEventListener("done", () => events.close());
 
 ## Shutdown
 
-On `SIGTERM` (e.g. `systemctl stop`) or `SIGINT`, the relayer stops picking up new deposits, lets
+On `SIGTERM` (e.g. `docker compose stop`) or `SIGINT`, the relayer stops picking up new deposits, lets
 any settle already in flight finish, saves each adapter's checkpoint and exits. If that takes
 longer than `SHUTDOWN_TIMEOUT_MS` (default 120s), or a second signal arrives, it exits immediately.
 That's still safe: settling is idempotent, so an interrupted deposit is just retried on the next
-start. The systemd unit's `TimeoutStopSec=150` leaves room for the default timeout.
+start. `stop_grace_period: 150s` in `compose.yaml` leaves room for the default timeout.
 
 ## Running on a server
 
-`systemd/xon-relayer.service` is the production unit: a dedicated no-login user, a hardened
-sandbox (read-only filesystem apart from its state directory, no privilege escalation, restricted
-syscalls), state in `/var/lib/xon-relayer`, and the key from an encrypted systemd credential.
+The relayer and the front-end API run as two Docker containers from one image (`Dockerfile`,
+`compose.yaml`). Each runs as a fixed non-root uid (10001) with no matching host account, on a
+read-only filesystem with all capabilities dropped. They use host networking, so `/health` and the
+API stay on `127.0.0.1` and an RPC on the host's localhost is reachable. Host paths:
+
+| Path | Contents | Owner, mode |
+|---|---|---|
+| `/etc/xon-relayer.env` | settings, no key | root, `0600` |
+| `/etc/xon-relayer/relayer-key` | the relayer key, mounted as a Docker secret | `10001`, `0400` |
+| `/var/lib/xon-relayer` | checkpoints and ledger (the API mounts it read-only) | `10001`, `0700` |
+
+Run every `docker compose` command from `/opt/xon-relayer`.
 
 ### First deploy
 
 ```bash
-# 1. Service user and code (Node 20.10+; Node 22 recommended)
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin xonrelayer
+# 1. Docker and the code
+curl -fsSL https://get.docker.com | sudo sh
 sudo git clone <this repo> /opt/xon-relayer && cd /opt/xon-relayer
-sudo npm ci && sudo npm run build
 
 # 2. Settings: copy .env.example, fill it in, and DELETE the RELAYER_PRIVATE_KEY line.
 #    Set XODE_CHAIN_ID / ASSETHUB_CHAIN_ID / ETHEREUM_CHAIN_ID, the payout caps, the MIN_*_XON
-#    thresholds and ALERT_WEBHOOK_URL. Don't set CHECKPOINT_DIR (the unit sets it).
+#    thresholds and ALERT_WEBHOOK_URL. CHECKPOINT_DIR is set by compose.yaml.
 sudo install -m 600 -o root -g root .env.example /etc/xon-relayer.env && sudoedit /etc/xon-relayer.env
 
-# 3. The relayer key, encrypted at rest (paste the 0x... key, then Ctrl-D). It never touches disk
-#    in plain text, and isn't visible in the environment or process list.
-sudo mkdir -p /etc/xon-relayer
-sudo systemd-creds encrypt --name=relayer-key - /etc/xon-relayer/relayer-key.cred
+# 3. The relayer key (paste the 0x... key, then Ctrl-D) and the state directory
+sudo mkdir -p /etc/xon-relayer /var/lib/xon-relayer
+sudo install -m 400 -o 10001 -g 10001 /dev/stdin /etc/xon-relayer/relayer-key
+sudo chown 10001:10001 /var/lib/xon-relayer && sudo chmod 700 /var/lib/xon-relayer
 
-# 4. Install and start
-sudo cp systemd/xon-relayer.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now xon-relayer
-journalctl -u xon-relayer -f
+# 4. Build (runs the typecheck and unit tests) and start
+sudo docker compose up -d --build
+sudo docker compose logs -f relayer
 ```
 
-`LoadCredentialEncrypted` needs systemd 250+ (Ubuntu 24.04, Debian 12; check with
-`systemctl --version`). On older systemd, such as Ubuntu 22.04's 249, keep the key in a root-only
-file and point the service at it with a drop-in, instead of step 3:
-
-```bash
-sudo mkdir -p /etc/xon-relayer
-sudo install -m 600 -o root -g root /dev/stdin /etc/xon-relayer/relayer-key   # paste the key, Ctrl-D
-sudo systemctl edit xon-relayer   # add the two lines below, save
-#   [Service]
-#   LoadCredential=relayer-key:/etc/xon-relayer/relayer-key
-```
-
-`systemd/xon-relayer-cmd` picks up whichever key file exists. The key is then plaintext at rest,
-but still only readable by root and the service.
+The key is plaintext at rest, readable only by root and the container. It isn't in the image, the
+container's environment or the process list. Compose reads `/etc/xon-relayer.env` itself, so a
+`$` in a value must be written `$$`.
 
 At startup the relayer refuses to run if:
 - another relayer is already running against the same state directory;
@@ -364,57 +360,83 @@ At startup the relayer refuses to run if:
 - a chain's RPC can't serve its confirmation setting (e.g. no `finalized` tag);
 - the key doesn't match the vending contract's `relayer`.
 
-### Front-end API service
+### Front-end API
 
-`systemd/xon-api.service` runs the front-end API next to the relayer. It uses the same settings
-file and reads the relayer's ledger, but never gets the key:
+The `api` container starts with the relayer. It uses the same settings file and reads the
+relayer's ledger, but never gets the key:
 
 ```bash
-sudo cp systemd/xon-api.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now xon-api
 curl http://127.0.0.1:8080/api/health
 ```
 
 It listens on localhost only. Reach it through an SSH tunnel, or put a TLS reverse proxy in front
-of it (set `API_CORS_ORIGINS` in `/etc/xon-relayer.env` to the UI's origin). After an update,
-restart it along with the relayer.
+of it (set `API_CORS_ORIGINS` in `/etc/xon-relayer.env` to the UI's origin). To run the relayer
+alone, use `sudo docker compose up -d relayer`.
+
+### Moving an existing server from systemd
+
+Build first so the switch-over is short, stop the systemd units (gracefully), hand the state and
+key to uid 10001, and start the containers. Masking the units matters: the instance lock can't
+see a process in another PID namespace, so a systemd relayer and a container relayer would not
+stop each other.
+
+```bash
+cd /opt/xon-relayer && sudo git pull && sudo docker compose build
+
+# The key as a file. Ubuntu 22.04 setups already have /etc/xon-relayer/relayer-key. With the
+# encrypted credential (systemd 250+), decrypt it once:
+sudo systemd-creds decrypt /etc/xon-relayer/relayer-key.cred /etc/xon-relayer/relayer-key
+sudo chown 10001:10001 /etc/xon-relayer/relayer-key && sudo chmod 400 /etc/xon-relayer/relayer-key
+
+sudo systemctl disable --now xon-api xon-relayer   # waits for in-flight settles
+sudo systemctl mask xon-api xon-relayer
+sudo chown -R 10001:10001 /var/lib/xon-relayer
+
+sudo docker compose up -d
+sudo docker compose logs -f relayer
+```
+
+Then point the reconcile cron entry at `docker/xon-relayer-cmd` (see Reconciliation). To roll
+back: `sudo docker compose down`, `sudo chown -R xonrelayer:xonrelayer /var/lib/xon-relayer`,
+`sudo systemctl unmask xon-api xon-relayer`, and `sudo systemctl enable --now xon-relayer xon-api`.
+The `systemd/` units are kept for that.
 
 ### Deploying an update
 
 ```bash
-cd /opt/xon-relayer && sudo git pull && sudo npm ci && sudo npm test && sudo npm run build
-sudo systemctl restart xon-relayer   # graceful: finishes in-flight settles first
+cd /opt/xon-relayer && sudo git pull
+sudo docker compose up -d --build   # graceful: finishes in-flight settles before replacing
 ```
 
 ### Operator commands
 
 ```bash
-sudo /opt/xon-relayer/systemd/xon-relayer-cmd reconcile
-sudo /opt/xon-relayer/systemd/xon-relayer-cmd refunds -- --all
-sudo /opt/xon-relayer/systemd/xon-relayer-cmd settle-held 0x<source tx hash> [--index <n>]
+sudo /opt/xon-relayer/docker/xon-relayer-cmd reconcile
+sudo /opt/xon-relayer/docker/xon-relayer-cmd refunds -- --all
+sudo /opt/xon-relayer/docker/xon-relayer-cmd settle-held 0x<source tx hash> [--index <n>]
 ```
 
-These run as the service user with the service's settings and key, via `systemd-run`.
+Each runs in a one-off container with the relayer's settings, state directory and key.
 
 ### Checklist
 
 - Back up `/var/lib/xon-relayer` (the ledger is the audit trail; checkpoints let it resume).
 - Point external monitoring at `/health` - it also catches the process being down entirely, which
-  the relayer's own alerts can't.
-- Run exactly one relayer per relayer key. The lock file stops a second one on the same machine,
-  but not on another machine.
+  the relayer's own alerts can't. `docker ps` shows the same check as the container's health.
+- Run exactly one relayer per relayer key. The lock file stops a second one using the same state
+  directory, but not one on another machine.
 - Schedule `reconcile` daily (see Reconciliation).
 
 ## Runbook
 
 **Unrecorded payout (reconcile) - treat as a key compromise until proven otherwise.**
 1. Pause `XonVendingMachine` with the owner key so nothing more can be paid out.
-2. Stop the relayer: `systemctl stop xon-relayer`.
+2. Stop the relayer: `docker compose stop relayer`.
 3. Rotate the key. Generate a new one, run `setRelayer(newAddress)` with the owner key, and
-   re-encrypt the credential (step 3 of First deploy).
+   replace `/etc/xon-relayer/relayer-key` (step 3 of First deploy).
 4. Investigate the payout in the ledger and on-chain, then unpause and restart.
 
-**Adapter stalled (alert, or `/health` returns 503).** Check `journalctl -u xon-relayer`.
+**Adapter stalled (alert, or `/health` returns 503).** Check `docker compose logs relayer`.
 - Repeated "Failed to settle": the error name says why. `IsPaused` means the contract is paused;
   `InsufficientReserve` means it needs more XON; `NotRelayer` means the key and contract disagree.
 - "Poll tick failed": the RPC is down or rate-limited.
@@ -442,5 +464,5 @@ recorded nothing for the rest. After upgrading, `reconcile` reports those as mis
 (`<tx> #1`, `#2`, ...); reprocess them the same way.
 
 **Relayer won't start, "Another relayer is already running".** Find the other process
-(`systemctl status xon-relayer`, `ps`). Only delete `/var/lib/xon-relayer/relayer.lock` once you're
+(`docker ps`, `systemctl status xon-relayer`, `ps`). Only delete `/var/lib/xon-relayer/relayer.lock` once you're
 sure nothing else is running.

@@ -1,0 +1,20 @@
+#!/bin/sh
+# Runs an operator command in a one-off container with exactly the same settings, state directory
+# and relayer key as the relayer container - so you never handle the key yourself.
+#
+#   sudo /opt/xon-relayer/docker/xon-relayer-cmd reconcile
+#   sudo /opt/xon-relayer/docker/xon-relayer-cmd refunds -- --all
+#   sudo /opt/xon-relayer/docker/xon-relayer-cmd settle-held 0x<source tx hash> [--index <n>]
+set -eu
+
+case "${1:-}" in
+  settle-held) script=settleHeld ;;
+  refunds) script=refunds ;;
+  reconcile) script=reconcile ;;
+  *) echo "usage: $0 settle-held|refunds|reconcile [args...]" >&2; exit 2 ;;
+esac
+shift
+[ "${1:-}" = "--" ] && shift
+
+exec docker compose -f "$(dirname "$0")/../compose.yaml" run --rm --no-deps -T relayer \
+  node "dist/tools/$script.js" "$@"

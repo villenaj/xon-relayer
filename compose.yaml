@@ -1,0 +1,56 @@
+# Production deployment: the relayer and the front-end API, from the same image. Uses the same
+# host paths the systemd units did, so an existing server keeps its settings and state:
+#   /etc/xon-relayer.env          settings (no key)
+#   /etc/xon-relayer/relayer-key  the relayer key, owned by uid 10001, mode 0400
+#   /var/lib/xon-relayer          checkpoints and ledger, owned by uid 10001, mode 0700
+# See "Running on a server" in the README.
+
+x-common: &common
+  build: .
+  image: xon-relayer:latest
+  env_file: /etc/xon-relayer.env
+  environment: &env
+    # Wins over the env file, as the systemd units' Environment= did.
+    CHECKPOINT_DIR: /var/lib/xon-relayer
+  # Host networking keeps every address as it was under systemd: /health and the API stay on
+  # 127.0.0.1, an RPC on the host's localhost is reachable, and the API finds the relayer's /health.
+  network_mode: host
+  restart: unless-stopped
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  logging:
+    driver: json-file
+    options: { max-size: 10m, max-file: "5" }
+
+services:
+  relayer:
+    <<: *common
+    container_name: xon-relayer
+    environment:
+      <<: *env
+      RELAYER_PRIVATE_KEY_FILE: /run/secrets/relayer-key
+    secrets: [relayer-key]
+    volumes:
+      - /var/lib/xon-relayer:/var/lib/xon-relayer
+    # In-flight settles get time to finish on stop - keep above SHUTDOWN_TIMEOUT_MS (default 120s).
+    stop_grace_period: 150s
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch(`http://127.0.0.1:$${process.env.HTTP_PORT ?? 9464}/health`).then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 2m
+
+  # Keyless: never gets the secret, and only reads the relayer's ledger.
+  api:
+    <<: *common
+    container_name: xon-api
+    command: ["node", "dist/api/index.js"]
+    volumes:
+      - /var/lib/xon-relayer:/var/lib/xon-relayer:ro
+    depends_on: [relayer]
+
+secrets:
+  relayer-key:
+    file: /etc/xon-relayer/relayer-key

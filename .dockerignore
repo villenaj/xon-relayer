@@ -1,0 +1,9 @@
+# Never bake settings or keys into the image - the container gets them from /etc at run time.
+.env
+setup.env
+setup.out.env
+.checkpoints/
+node_modules/
+dist/
+.git/
+*.log
