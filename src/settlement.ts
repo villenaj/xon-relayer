@@ -134,11 +134,13 @@ export interface SettlementClientOptions {
   /// Chain ID the Xode RPC must report, if configured.
   expectedChainId: bigint | null;
   rpcTimeoutMs: number;
+  /// Development only: let the relayer key also be the vending contract's owner.
+  allowOwnerAsRelayer?: boolean;
 }
 
 export type SettlementClient = Awaited<ReturnType<typeof createSettlementClient>>;
 
-export async function createSettlementClient({ xodeEthRpc, vendingAddress, relayerPrivateKey, expectedChainId, rpcTimeoutMs }: SettlementClientOptions) {
+export async function createSettlementClient({ xodeEthRpc, vendingAddress, relayerPrivateKey, expectedChainId, rpcTimeoutMs, allowOwnerAsRelayer = false }: SettlementClientOptions) {
   const provider = makeProvider(xodeEthRpc, rpcTimeoutMs);
   const chainId = await verifyEndpoint(provider, { label: "xode", expectedChainId, contracts: { XonVendingMachine: vendingAddress } });
   const wallet = new ethers.Wallet(relayerPrivateKey, provider);
@@ -157,6 +159,15 @@ export async function createSettlementClient({ xodeEthRpc, vendingAddress, relay
       `The relayer key (${wallet.address}) does not match XonVendingMachine's relayer (${onChainRelayer}). ` +
       `Call setRelayer on the contract first, or use the right key.`,
     );
+  }
+  // The relayer key lives on a server and signs unattended; the owner key can withdraw the whole
+  // XON reserve and USDT inventory, lift every limit and replace the relayer. One key for both
+  // means stealing the relayer key takes everything, and the limits stop bounding the loss.
+  const owner: string = await vending.owner();
+  if (owner.toLowerCase() === wallet.address.toLowerCase()) {
+    const message = `The relayer key (${wallet.address}) is also XonVendingMachine's owner - a stolen relayer key would then control the reserve, the inventory and every limit. Give the relayer its own key (setRelayer, owner key), or set ALLOW_OWNER_AS_RELAYER=true for development.`;
+    if (!allowOwnerAsRelayer) throw new Error(message);
+    console.warn(`WARNING: ${message}`);
   }
 
   return {

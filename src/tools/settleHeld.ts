@@ -79,6 +79,7 @@ async function main(): Promise<void> {
     relayerPrivateKey: loadRelayerKey().key,
     expectedChainId: config.xodeChainId,
     rpcTimeoutMs: config.rpcTimeoutMs,
+    allowOwnerAsRelayer: config.allowOwnerAsRelayer,
   });
   const ledger = makeLedger(config.ledgerFile);
   const entry = {

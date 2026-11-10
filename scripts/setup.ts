@@ -2,11 +2,14 @@
 // XonVendingMachine (Xode) and EthUsdtGateway (AssetHub and Ethereum), and funds every account and
 // contract the relayer needs. Writes the resulting relayer settings to an env file.
 //
-// Two keys run everything:
+// Keys:
 //   - ASSET_OWNER_SURI: one Substrate (sr25519) account, used on both Xode and AssetHub. It creates
 //     and mints the USDT asset and pays the native tokens (gas, the XON reserve) to the EVM accounts.
 //   - CONTRACT_OWNER_KEY: one EVM key that deploys and owns all three contracts.
-// The relayer key defaults to the contract owner's (fine for dev/test - see README for production).
+//   - RELAYER_PRIVATE_KEY: the relayer's own key - generated if unset. It's never the owner's: the
+//     relayer refuses to run with the owner key (ALLOW_OWNER_AS_RELAYER=true overrides, dev only).
+//   - RATE_KEEPER_PRIVATE_KEY: the key allowed to nudge the fixed rate toward the DEX price within
+//     the bounds below - generated if unset; RATE_KEEPER=false skips appointing one.
 //
 // Safe to re-run: the asset is only created if missing, balances are topped up to their targets
 // rather than sent again, and contracts named in VENDING_ADDRESS / ASSETHUB_GATEWAY_ADDRESS /
@@ -57,6 +60,12 @@ const VENDING_RESERVE_XON = ethers.parseEther(env("VENDING_RESERVE_XON", "500"))
 const GAS_BUFFER = env("GAS_BUFFER", "100"); // whole native tokens each EVM account keeps for gas
 const MAX_PER_DEPOSIT = usdt(env("EXTERNAL_MAX_PER_DEPOSIT_USDT", "100"));
 const MAX_PER_DAY = usdt(env("EXTERNAL_MAX_PER_DAY_USDT", "1000"));
+// Limits on the Xode-native purchase paths (buy / settlePurchase), which start closed on-chain.
+const NATIVE_MAX_PER_PURCHASE = usdt(env("NATIVE_MAX_PER_PURCHASE_USDT", "100"));
+const NATIVE_MAX_PER_DAY = usdt(env("NATIVE_MAX_PER_DAY_USDT", "1000"));
+const RATE_KEEPER = flag("RATE_KEEPER", true);
+const RATE_KEEPER_MAX_STEP_BPS = BigInt(env("RATE_KEEPER_MAX_STEP_BPS", "200")); // 2% per update
+const RATE_KEEPER_MIN_INTERVAL = BigInt(env("RATE_KEEPER_MIN_INTERVAL_SECONDS", "600"));
 
 const ANVIL_CHAIN_ID = 31337n;
 const ANVIL_DEFAULT_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -189,13 +198,17 @@ async function main(): Promise<void> {
   const generatedOwner = !process.env.CONTRACT_OWNER_KEY;
   const ownerKey = process.env.CONTRACT_OWNER_KEY || ethers.Wallet.createRandom().privateKey;
   const owner = new ethers.Wallet(ownerKey);
-  const relayerKey = process.env.RELAYER_PRIVATE_KEY || ownerKey;
+  const generatedRelayer = !process.env.RELAYER_PRIVATE_KEY;
+  const relayerKey = process.env.RELAYER_PRIVATE_KEY || ethers.Wallet.createRandom().privateKey;
   const relayer = new ethers.Wallet(relayerKey);
   const relayerIsOwner = relayer.address === owner.address;
+  const keeperKey = RATE_KEEPER ? (process.env.RATE_KEEPER_PRIVATE_KEY || ethers.Wallet.createRandom().privateKey) : null;
+  const keeper = keeperKey ? new ethers.Wallet(keeperKey) : null;
 
   console.log("asset owner (Xode + AssetHub):", assetOwner.address);
   console.log("contract owner:", owner.address, generatedOwner ? "(generated - saved to the output file)" : "");
-  console.log("relayer:", relayer.address, relayerIsOwner ? "(same key as the contract owner)" : "");
+  console.log("relayer:", relayer.address, relayerIsOwner ? "(same key as the contract owner - the relayer will refuse it unless ALLOW_OWNER_AS_RELAYER=true)" : generatedRelayer ? "(generated - saved to the output file)" : "");
+  if (keeper) console.log("rate keeper:", keeper.address);
 
   const gas = ethers.parseEther(GAS_BUFFER);
   const usdtRecipients = [owner.address, ...USDT_RECIPIENTS];
@@ -209,6 +222,7 @@ async function main(): Promise<void> {
   try {
     const xodeFunding: SubstrateFunding[] = [{ evmAddress: owner.address, target: VENDING_RESERVE_XON + gas }];
     if (!relayerIsOwner) xodeFunding.push({ evmAddress: relayer.address, target: gas });
+    if (keeper) xodeFunding.push({ evmAddress: keeper.address, target: gas });
     xodeFunding.push(...buyerFunding);
     await setUpSubstrateChain("xode", xode, assetOwner, usdtRecipients, xodeFunding);
   } finally {
@@ -236,6 +250,15 @@ async function main(): Promise<void> {
     await (await vending.contract.setExternalLimits(MAX_PER_DEPOSIT, MAX_PER_DAY)).wait();
     console.log(`[xode] external limits set: ${ethers.formatUnits(MAX_PER_DEPOSIT, 6)} USDT/deposit, ${ethers.formatUnits(MAX_PER_DAY, 6)} USDT/day`);
   }
+  if ((await vending.contract.maxNativePerPurchase()) !== NATIVE_MAX_PER_PURCHASE || (await vending.contract.maxNativePerDay()) !== NATIVE_MAX_PER_DAY) {
+    await (await vending.contract.setNativeLimits(NATIVE_MAX_PER_PURCHASE, NATIVE_MAX_PER_DAY)).wait();
+    console.log(`[xode] native limits set: ${ethers.formatUnits(NATIVE_MAX_PER_PURCHASE, 6)} USDT/purchase, ${ethers.formatUnits(NATIVE_MAX_PER_DAY, 6)} USDT/day`);
+  }
+  if (keeper && ((await vending.contract.rateKeeper()) !== keeper.address || (await vending.contract.maxRateStepBps()) !== RATE_KEEPER_MAX_STEP_BPS || (await vending.contract.minRateUpdateInterval()) !== RATE_KEEPER_MIN_INTERVAL)) {
+    await (await vending.contract.setRateKeeper(keeper.address, RATE_KEEPER_MAX_STEP_BPS, RATE_KEEPER_MIN_INTERVAL)).wait();
+    console.log(`[xode] rate keeper ${keeper.address}: up to ${Number(RATE_KEEPER_MAX_STEP_BPS) / 100}% per update, every ${RATE_KEEPER_MIN_INTERVAL}s at most`);
+  }
+  if (keeperKey) out.RATE_KEEPER_PRIVATE_KEY = keeperKey;
   Object.assign(out, {
     VENDING_ADDRESS: vending.address,
     MAX_EXTERNAL_DEPOSIT_USDT: ethers.formatUnits(MAX_PER_DEPOSIT, 6),
@@ -309,7 +332,7 @@ async function main(): Promise<void> {
   ];
   writeFileSync(OUTPUT_ENV, lines.join("\n"), { mode: 0o600 });
   console.log(`\nDone. Relayer settings written to ${OUTPUT_ENV}`);
-  if (relayerIsOwner) console.log("Note: the relayer is using the contract owner's key - fine for dev/test, use a separate relayer key in production.");
+  if (relayerIsOwner) console.log("Note: the relayer key is the contract owner's - the relayer refuses it unless ALLOW_OWNER_AS_RELAYER=true. Use a separate key (unset RELAYER_PRIVATE_KEY to generate one).");
 }
 
 main().catch((e: unknown) => { console.error(e); process.exit(1); });

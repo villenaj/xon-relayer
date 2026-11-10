@@ -12,6 +12,7 @@ import { classifySettleError } from "../../src/errorClassifier.js";
 import { makeLedger, readLedger } from "../../src/ledger.js";
 import { depositIdAt, externalDepositId } from "../../src/settlement.js";
 import { diagnoseSwapFailure, type XodeDex } from "../../src/xodeDex.js";
+import { deviationBps, nextRate } from "../../src/rateKeeper.js";
 import { isAccountedByVending } from "../../src/adapters/accountedTransfers.js";
 import { fakeContext, quiet, revertError, tmpDir, vending } from "./helpers.js";
 import GATEWAY_ABI from "../../src/abi/EthUsdtGateway.json" with { type: "json" };
@@ -50,6 +51,7 @@ function fakeDex(state: { paused?: boolean; active?: boolean; quote?: bigint | n
     swapsPaused: async () => state.paused ?? false,
     poolActive: async () => state.active ?? true,
     quoteUsdtToXon: async () => (state.quote === undefined ? 10n ** 18n : state.quote),
+    spotXonPerUsdt: async () => 2n * 10n ** 17n,
     disconnect: async () => {},
   };
 }
@@ -259,5 +261,29 @@ test("USDT the vending contract pulled in itself (buy, fundUsdtInventory) isn't 
   assert.equal(await isAccountedByVending(provider, VENDING, "deposit"), false);
   assert.equal(await isAccountedByVending(provider, VENDING, "spoofed"), false);
   await assert.rejects(isAccountedByVending(provider, VENDING, "missing"), /No receipt/);
+});
+
+// --- rate keeper ------------------------------------------------------------------------------------
+
+test("the rate keeper steps toward the DEX price, within the contract's step and its own deadband", () => {
+  const e = (x: string) => ethers.parseEther(x);
+  const step = { maxStepBps: 200n, deadbandBps: 50n };
+  // Inside the 0.5% deadband: leave it.
+  assert.equal(nextRate({ current: e("0.2"), target: e("0.2009"), ...step }), null);
+  // Close enough to reach in one step: go straight to the market.
+  assert.equal(nextRate({ current: e("0.2"), target: e("0.203"), ...step }), e("0.203"));
+  assert.equal(nextRate({ current: e("0.2"), target: e("0.197"), ...step }), e("0.197"));
+  // Far off: one 2% step at a time, up or down, never past the target.
+  assert.equal(nextRate({ current: e("0.2"), target: e("0.25"), ...step }), e("0.204"));
+  assert.equal(nextRate({ current: e("0.2"), target: e("0.1"), ...step }), e("0.196"));
+  // The inverted price from earlier (5 XON/USDT vs 0.2) converges in bounded steps, never overshooting.
+  let rate = e("5");
+  for (let i = 0; i < 500 && rate !== e("0.2"); i++) rate = nextRate({ current: rate, target: e("0.2"), ...step }) ?? rate;
+  assert.ok(deviationBps(rate, e("0.2")) <= 50n, `converged to ${ethers.formatEther(rate)}`);
+  // Nothing to do without a price, a rate, or any room to step.
+  assert.equal(nextRate({ current: 0n, target: e("0.2"), ...step }), null);
+  assert.equal(nextRate({ current: e("0.2"), target: 0n, ...step }), null);
+  assert.equal(nextRate({ current: e("0.2"), target: e("0.3"), maxStepBps: 0n, deadbandBps: 50n }), null);
+  assert.equal(deviationBps(e("0.21"), e("0.2")), 500n);
 });
 

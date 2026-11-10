@@ -95,6 +95,23 @@ export function loadRelayerKey(): { key: string; source: string } {
   return { key, source };
 }
 
+/// The rate keeper's key (see rateKeeper.ts), from RATE_KEEPER_PRIVATE_KEY_FILE or
+/// RATE_KEEPER_PRIVATE_KEY, or null for none. Never echoed.
+function rateKeeperKey(): string | null {
+  const file = process.env.RATE_KEEPER_PRIVATE_KEY_FILE;
+  const raw = (file ? readFileSync(file, "utf8") : process.env.RATE_KEEPER_PRIVATE_KEY ?? "").trim();
+  delete process.env.RATE_KEEPER_PRIVATE_KEY;
+  if (!raw) return null;
+  if (!/^(0x)?[0-9a-fA-F]{64}$/.test(raw)) throw new Error("The rate keeper key isn't a 32-byte hex private key.");
+  return raw.startsWith("0x") ? raw : `0x${raw}`;
+}
+
+function bps(name: string, fallback: number): bigint {
+  const value = Number(process.env[name] ?? fallback);
+  if (!Number.isInteger(value) || value < 0 || value > 10_000) throw new Error(`${name} must be basis points from 0 to 10000 (got "${process.env[name]}").`);
+  return BigInt(value);
+}
+
 export const config = {
   // Xode side - every adapter ends up calling settlePurchase/settleExternalPurchase here.
   xodeEthRpc: process.env.XODE_ETH_RPC ?? "http://127.0.0.1:8546",
@@ -102,6 +119,8 @@ export const config = {
   // Optional, but set them in production: the relayer refuses to start if an RPC reports a
   // different chain, so a testnet RPC can't be paired with mainnet addresses (or vice versa).
   xodeChainId: optionalChainId("XODE_CHAIN_ID"),
+  // Development only: start even though the relayer key is also the vending contract's owner.
+  allowOwnerAsRelayer: bool("ALLOW_OWNER_AS_RELAYER", false),
   // Xode's Substrate RPC (ws:// or wss://), for market-price payouts: the front-end API quotes
   // swaps from the DEX with it, and the relayer asks it why a swap failed (paused, pool pending, or
   // below the buyer's minimum - see xodeDex.ts). Without it, failed swaps are only ever retried.
@@ -145,6 +164,14 @@ export const config = {
   minVendingReserve: optionalXon("MIN_VENDING_RESERVE_XON"),
   // USDT the vending contract holds for market-price payouts (`accountedUsdt`); below this, alert.
   minUsdtInventory: optionalUsdt("MIN_USDT_INVENTORY"),
+
+  // Fixed-rate drift (see rateKeeper.ts; needs XODE_SUBSTRATE_RPC for the DEX price). Without a
+  // keeper key it only alerts past RATE_ALERT_BPS; with one it also moves the rate toward the
+  // market whenever it's more than RATE_DEADBAND_BPS off, within the contract's own bounds.
+  rateKeeperKey: rateKeeperKey(),
+  rateKeeperIntervalMs: Number(process.env.RATE_KEEPER_INTERVAL_MS ?? 60_000),
+  rateDeadbandBps: bps("RATE_DEADBAND_BPS", 50),
+  rateAlertBps: bps("RATE_ALERT_BPS", 300),
   // Optional chat webhook (Slack/Discord/Mattermost-style) that alerts are POSTed to.
   alertWebhookUrl: process.env.ALERT_WEBHOOK_URL || null,
 
@@ -210,6 +237,7 @@ export function validateConfig(): void {
     RPC_TIMEOUT_MS: config.rpcTimeoutMs,
     API_MAX_STREAMS: config.apiMaxStreams,
     API_POLL_INTERVAL_MS: config.apiPollIntervalMs,
+    RATE_KEEPER_INTERVAL_MS: config.rateKeeperIntervalMs,
   };
   for (const [name, value] of Object.entries(positiveIntegers)) {
     if (!Number.isInteger(value) || value < 1) {

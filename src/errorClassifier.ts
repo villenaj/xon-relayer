@@ -16,17 +16,18 @@ const PERMANENT_ERRORS = new Set([
   // contract with no working receive/fallback) - retrying won't change how that address behaves
 ]);
 
-// Over XonVendingMachine's own per-deposit limit on external payouts: can't succeed until the
+// Over XonVendingMachine's own per-deposit limit on external payouts (or per-purchase limit on
+// Xode-native ones): can't succeed until the
 // owner raises it (setExternalLimits), which stalling would block every later deposit on. Held for
 // an operator instead, like a deposit over the relayer's own per-deposit cap.
-const HELD_ERRORS = new Set(["OverExternalDepositLimit"]);
+const HELD_ERRORS = new Set(["OverExternalDepositLimit", "OverNativePurchaseLimit"]);
 
 // Not really a failure - some other attempt (a previous retry that we lost track of, or a race
 // between adapters) already got this exact deposit settled. Nothing left to do.
 const ALREADY_DONE_ERRORS = new Set(["AlreadySettled", "AlreadyExternallySettled"]);
 
 // Anything else (IsPaused, InsufficientReserve, UnverifiedDeposit, NotRelayer, Reentrant,
-// OverExternalDailyLimit - which refills over time - or any error we can't decode at all - a plain
+// OverExternalDailyLimit / OverNativeDailyLimit - which refill over time - or any error we can't decode at all - a plain
 // RPC/network failure, say) is treated as transient by default: an operator can fix all of these
 // by acting (unpausing, topping up the reserve, fixing a misconfigured relayer key), and wrongly
 // giving up on a legitimate deposit is worse than retrying one a little too long.

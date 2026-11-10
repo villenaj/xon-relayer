@@ -13,6 +13,7 @@ import { runXodeAdapter } from "./adapters/xodeAdapter.js";
 import { runAssetHubAdapter } from "./adapters/assetHubAdapter.js";
 import { runEthereumAdapter } from "./adapters/ethereumAdapter.js";
 import { connectXodeDex, type XodeDex } from "./xodeDex.js";
+import { runRateKeeper } from "./rateKeeper.js";
 
 async function main(): Promise<void> {
   validateConfig();
@@ -55,6 +56,7 @@ async function main(): Promise<void> {
     relayerPrivateKey: relayerKey.key,
     expectedChainId: config.xodeChainId,
     rpcTimeoutMs: config.rpcTimeoutMs,
+    allowOwnerAsRelayer: config.allowOwnerAsRelayer,
   });
   console.log(`Relayer address: ${settlement.relayerAddress} (key from ${relayerKey.source})`);
   console.log(`Vending contract: ${config.vendingAddress} on Xode chain ${settlement.chainId}`);
@@ -111,7 +113,9 @@ async function main(): Promise<void> {
   // Each adapter and the monitor loop until shutdown, handling anything retryable internally - so
   // a rejection here is truly unrecoverable, and brings the whole process down (Promise.all
   // rejects on the first one) rather than leaving it running half-working.
-  await Promise.all([...adapters, runMonitor(context)]);
+  const keeperLoop = dex ? [runRateKeeper({ settlement, config, dex, telemetry, alerts, shutdown })] : [];
+  if (!dex && config.rateKeeperKey) console.warn("RATE_KEEPER_PRIVATE_KEY is set but XODE_SUBSTRATE_RPC isn't - the keeper needs the DEX price, so it won't run.");
+  await Promise.all([...adapters, runMonitor(context), ...keeperLoop]);
 
   server?.close();
   await dex?.disconnect();

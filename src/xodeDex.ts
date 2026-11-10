@@ -24,6 +24,9 @@ export interface XodeDex {
   /// XON (18-decimal units, as Solidity sees it) the pool gives for `usdtAmount` raw USDT right
   /// now, after the pool fee - or null if there's no pool / no liquidity.
   quoteUsdtToXon(usdtAmount: bigint): Promise<bigint | null>;
+  /// The pool's spot price as XON (18-decimal units) per 1 whole USDT - the vending contract's
+  /// `rate` units - from its reserves, before fees and price impact. Null if there's no pool.
+  spotXonPerUsdt(): Promise<bigint | null>;
   /// Whether governance has paused the swap call the XCM exchange stands in for.
   swapsPaused(): Promise<boolean>;
   /// Whether the XON/USDT pool may be traded: false while AssetWaiting still has it pending.
@@ -42,6 +45,15 @@ export async function connectXodeDex(url: string): Promise<XodeDex> {
       const quote = await api.call.assetConversionApi.quotePriceExactTokensForTokens(USDT, XON, usdtAmount, true);
       const planck = (quote as unknown as { isSome: boolean; unwrap(): { toBigInt(): bigint } });
       return planck.isSome ? planck.unwrap().toBigInt() * NATIVE_TO_ETH_RATIO : null;
+    },
+    async spotXonPerUsdt() {
+      const reserves = await api.call.assetConversionApi.getReserves(XON, USDT);
+      const pair = reserves as unknown as { isSome: boolean; unwrap(): [{ toBigInt(): bigint }, { toBigInt(): bigint }] };
+      if (!pair.isSome) return null;
+      const [xonPlanck, usdtRaw] = pair.unwrap().map((r) => r.toBigInt());
+      if (usdtRaw === 0n) return null;
+      // XON planck -> 18 decimals (x NativeToEthRatio), per 1 USDT (1e6 raw units).
+      return (xonPlanck * NATIVE_TO_ETH_RATIO * 1_000_000n) / usdtRaw;
     },
     async swapsPaused() {
       if (!api.query.txPause) return false;

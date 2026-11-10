@@ -69,6 +69,8 @@ export class Telemetry {
   private readonly relayerBalance = new Metric("xon_relayer_relayer_balance_xon", "Relayer account's native balance on Xode (pays gas).", "gauge");
   private readonly vendingReserve = new Metric("xon_relayer_vending_reserve_xon", "XonVendingMachine's XON balance (what payouts come from).", "gauge");
   private readonly externalPaid = new Metric("xon_relayer_external_paid_24h_usdt", "USDT paid out for AssetHub/Ethereum deposits in the rolling 24h cap window.", "gauge");
+  private readonly fixedRate = new Metric("xon_relayer_fixed_rate_xon_per_usdt", "XonVendingMachine's fixed rate, XON per 1 USDT.", "gauge");
+  private readonly marketRate = new Metric("xon_relayer_dex_rate_xon_per_usdt", "The Xode DEX's spot price, XON per 1 USDT.", "gauge");
   private readonly usdtInventory = new Metric("xon_relayer_usdt_inventory_usdt", "USDT XonVendingMachine holds for market-price payouts (accountedUsdt).", "gauge");
 
   constructor(private readonly stallAfterMs: number) {
@@ -103,6 +105,11 @@ export class Telemetry {
   setBalances(relayerXon: number, reserveXon: number): void {
     this.relayerBalance.set({}, relayerXon);
     this.vendingReserve.set({}, reserveXon);
+  }
+
+  setRates(fixedXonPerUsdt: number, dexXonPerUsdt: number | null): void {
+    this.fixedRate.set({}, fixedXonPerUsdt);
+    if (dexXonPerUsdt !== null) this.marketRate.set({}, dexXonPerUsdt);
   }
 
   setUsdtInventory(usdt: number): void {
@@ -145,7 +152,7 @@ export class Telemetry {
   renderMetrics(): string {
     const metrics = [
       this.startTime, this.lastTick, this.lastCaughtUp, this.behind, this.tickFailures,
-      this.settleAttempts, this.relayerBalance, this.vendingReserve, this.externalPaid, this.usdtInventory,
+      this.settleAttempts, this.relayerBalance, this.vendingReserve, this.externalPaid, this.usdtInventory, this.fixedRate, this.marketRate,
     ];
     return `${metrics.map((m) => m.render()).join("\n")}\n`;
   }

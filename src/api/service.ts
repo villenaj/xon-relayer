@@ -164,6 +164,15 @@ export function makeApiService(config: Config, networks: Networks, dex: XodeDex 
     return found;
   }
 
+  async function nativeLimits(): Promise<{ maxPerPurchase: bigint; maxPerDay: bigint; available: bigint } | null> {
+    try {
+      const [maxPerPurchase, maxPerDay, available]: bigint[] = await Promise.all([vending.maxNativePerPurchase(), vending.maxNativePerDay(), vending.nativeAvailable()]);
+      return { maxPerPurchase, maxPerDay, available };
+    } catch {
+      return null;
+    }
+  }
+
   async function externalLimits(): Promise<{ maxPerDeposit: bigint; maxPerDay: bigint; available: bigint } | null> {
     try {
       const [maxPerDeposit, maxPerDay, available]: bigint[] = await Promise.all([vending.maxExternalPerDeposit(), vending.maxExternalPerDay(), vending.externalAvailable()]);
@@ -200,6 +209,16 @@ export function makeApiService(config: Config, networks: Networks, dex: XodeDex 
         warnings.push("This amount is over the automatic payout limit - the deposit will be held for manual review before XON is paid.");
       } else if (limits && amount > limits.available) {
         warnings.push("Today's payout allowance is nearly used up - XON for this deposit may be delayed until it refills.");
+      }
+    } else {
+      // Xode-native purchases have their own limits (contracts that predate them don't).
+      const native = await nativeLimits();
+      if (native && (native.maxPerPurchase === 0n || native.maxPerDay === 0n)) {
+        warnings.push("Purchases on Xode are currently switched off - a transfer would be held until an operator enables them.");
+      } else if (native && amount > native.maxPerPurchase) {
+        warnings.push(`This is over the ${ethers.formatUnits(native.maxPerPurchase, USDT_DECIMALS)} USDT per-purchase limit on Xode - the transfer would be held for manual review before XON is paid.`);
+      } else if (native && amount > native.available) {
+        warnings.push("Today's Xode purchase allowance is nearly used up - XON for this transfer may be delayed until it refills.");
       }
     }
     return warnings;

@@ -1,0 +1,102 @@
+// Keeps XonVendingMachine's fixed `rate` close to the Xode DEX price. A fixed rate that drifts from
+// the market is free money: buy XON from the vending contract, sell it on the DEX (or the reverse
+// trade's equivalent loss on deposits). Every RATE_KEEPER_INTERVAL_MS this reads the pool's spot
+// price and, when the rate is off by more than RATE_DEADBAND_BPS, moves it one step toward the
+// market with `updateRate` - signed by the rate keeper key (never the owner's), and bounded on-chain
+// by the contract's maxRateStepBps / minRateUpdateInterval, so a stolen keeper key can only move
+// the price slowly. Without a keeper key it only alerts when the rate drifts past RATE_ALERT_BPS.
+
+import { ethers } from "ethers";
+import type { Alerts } from "./alerts.js";
+import type { Config } from "./config.js";
+import { describeError } from "./errorClassifier.js";
+import type { SettlementClient } from "./settlement.js";
+import type { Shutdown } from "./shutdown.js";
+import type { Telemetry } from "./telemetry.js";
+import type { XodeDex } from "./xodeDex.js";
+import VENDING_ABI from "./abi/XonVendingMachine.json" with { type: "json" };
+
+/// The rate to set next, or null to leave it: nothing inside the deadband; otherwise one step
+/// toward `target`, never past it and never more than `maxStepBps` of the current rate.
+export function nextRate({ current, target, maxStepBps, deadbandBps }: { current: bigint; target: bigint; maxStepBps: bigint; deadbandBps: bigint }): bigint | null {
+  if (current <= 0n || target <= 0n) return null;
+  const gap = target > current ? target - current : current - target;
+  if (gap * 10_000n <= target * deadbandBps) return null;
+  const maxStep = (current * maxStepBps) / 10_000n;
+  if (maxStep === 0n) return null;
+  const next = target > current ? (gap > maxStep ? current + maxStep : target) : (gap > maxStep ? current - maxStep : target);
+  return next === current ? null : next;
+}
+
+/// Basis points between `rate` and `target`, relative to the target.
+export const deviationBps = (rate: bigint, target: bigint): bigint => ((rate > target ? rate - target : target - rate) * 10_000n) / target;
+
+export interface RateKeeperOptions {
+  settlement: SettlementClient;
+  config: Config;
+  dex: XodeDex;
+  telemetry: Telemetry;
+  alerts: Alerts;
+  shutdown: Shutdown;
+}
+
+export async function runRateKeeper({ settlement, config, dex, telemetry, alerts, shutdown }: RateKeeperOptions): Promise<void> {
+  const { provider } = settlement;
+  const vendingAddress = await settlement.vending.getAddress();
+  const owner: string = await settlement.vending.owner();
+
+  // The keeper signs with its own key and nonce - never the relayer's NonceManager.
+  let keeper: ethers.Contract | null = null;
+  if (config.rateKeeperKey) {
+    const wallet = new ethers.Wallet(config.rateKeeperKey, provider);
+    if (wallet.address.toLowerCase() === owner.toLowerCase() && !config.allowOwnerAsRelayer) {
+      throw new Error(`The rate keeper key (${wallet.address}) is XonVendingMachine's owner - give the keeper its own key (setRateKeeper, owner key).`);
+    }
+    const appointed: string = await settlement.vending.rateKeeper();
+    if (appointed.toLowerCase() !== wallet.address.toLowerCase()) {
+      console.warn(`[rate] The rate keeper key (${wallet.address}) isn't XonVendingMachine's rateKeeper (${appointed}) - only watching the rate. Appoint it with setRateKeeper (owner key).`);
+    } else {
+      keeper = new ethers.Contract(vendingAddress, VENDING_ABI, wallet);
+      console.log(`[rate] Keeping the fixed rate within ${Number(config.rateDeadbandBps) / 100}% of the DEX price as ${wallet.address}.`);
+    }
+  } else {
+    console.log(`[rate] No RATE_KEEPER_PRIVATE_KEY - only alerting when the fixed rate is over ${Number(config.rateAlertBps) / 100}% off the DEX price.`);
+  }
+
+  let drifting = false;
+  async function check(): Promise<void> {
+    const [current, target] = await Promise.all([settlement.vending.rate() as Promise<bigint>, dex.spotXonPerUsdt()]);
+    telemetry.setRates(Number(ethers.formatEther(current)), target === null ? null : Number(ethers.formatEther(target)));
+    if (target === null) return;
+
+    const off = deviationBps(current, target);
+    const describe = () => `fixed rate ${ethers.formatEther(current)} XON/USDT vs DEX ${ethers.formatEther(target)} (${Number(off) / 100}% off)`;
+    if (off > config.rateAlertBps && !drifting) {
+      alerts.send(`[rate] The vending contract's ${describe()} - buying at the fixed rate and selling on the DEX (or the reverse) is profitable until it's corrected.`);
+      drifting = true;
+    } else if (off <= config.rateAlertBps && drifting) {
+      alerts.send(`[rate] Fixed rate back within ${Number(config.rateAlertBps) / 100}% of the DEX: ${describe()}.`);
+      drifting = false;
+    }
+    if (!keeper) return;
+
+    const [maxStepBps, minInterval, last, block] = await Promise.all([
+      keeper.maxRateStepBps() as Promise<bigint>, keeper.minRateUpdateInterval() as Promise<bigint>,
+      keeper.lastRateUpdate() as Promise<bigint>, provider.getBlock("latest"),
+    ]);
+    if (!block || BigInt(block.timestamp) < last + minInterval) return;
+    const next = nextRate({ current, target, maxStepBps, deadbandBps: config.rateDeadbandBps });
+    if (next === null) return;
+    const receipt = await (await keeper.updateRate(next)).wait();
+    console.log(`[rate] ${describe()} - rate set to ${ethers.formatEther(next)} (tx ${receipt?.hash}).`);
+  }
+
+  while (!shutdown.requested) {
+    try {
+      await check();
+    } catch (err) {
+      console.error("[rate] Check failed:", describeError(err));
+    }
+    await shutdown.sleep(config.rateKeeperIntervalMs);
+  }
+}
