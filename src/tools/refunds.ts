@@ -13,78 +13,19 @@
 //   npm run refunds -- mark <source tx> <refund tx> --force
 //                                                       record it without checking (e.g. refunded
 //                                                       some other way) - say why with --note "..."
+//                                                       (and --to <address> if its gateway was retired)
 //   ... mark <source tx> <refund tx> --index <n>        pick one deposit when the source tx holds
 //                                                       several awaiting a refund
 
 import { ethers } from "ethers";
-import { makeProvider } from "../chain.js";
 import { config, USDT_DECIMALS } from "../config.js";
-import { makeLedger, readLedger, type LedgerRecord } from "../ledger.js";
-import { externalChain, GATEWAY_DEPOSIT_TOPICS, option, runTool, TRANSFER_TOPIC } from "./common.js";
-import GATEWAY_ABI from "../abi/EthUsdtGateway.json" with { type: "json" };
-import VENDING_ABI from "../abi/XonVendingMachine.json" with { type: "json" };
+import { makeLedger, readLedger } from "../ledger.js";
+import { option, runTool } from "./common.js";
+import { awaitingRefund, refundProven, refundTarget } from "./refundTargets.js";
 
-interface RefundTarget {
-  provider: ethers.JsonRpcProvider;
-  /// Who paid the USDT - the refund goes back to them (not the Xode beneficiary).
-  payer: string;
-  usdtAddress: string;
-  /// The contract the USDT is sitting in; its owner has to send the refund.
-  heldBy: string;
-  /// Gateways with `refund`: the owner's call that pays this deposit back to its depositor.
-  refundCall?: { to: string; data: string };
-}
 
 const usdt = (amount: bigint) => `${ethers.formatUnits(amount, USDT_DECIMALS)} USDT`;
 
-/// Skipped deposits with something to refund, not yet refunded or settled, one per deposit.
-function awaitingRefund(records: LedgerRecord[]): LedgerRecord[] {
-  const done = new Set(records
-    .filter((r) => r.status === "refunded" || r.status === "settled" || r.status === "already-settled")
-    .map((r) => r.depositId));
-  const pending = new Map<string, LedgerRecord>();
-  for (const r of records) {
-    if (r.status === "skipped" && BigInt(r.usdtAmount) > 0n && !done.has(r.depositId)) pending.set(r.depositId, r);
-  }
-  return [...pending.values()];
-}
-
-async function refundTarget(record: LedgerRecord): Promise<RefundTarget> {
-  if (record.sourceChain === "xode") {
-    const provider = makeProvider(config.xodeEthRpc, config.rpcTimeoutMs);
-    const vending = new ethers.Contract(config.vendingAddress, VENDING_ABI, provider);
-    // For a Xode-native deposit the ledger's buyer *is* the USDT sender.
-    return { provider, payer: record.buyer, usdtAddress: await vending.usdt(), heldBy: await vending.getAddress() };
-  }
-
-  const chain = externalChain(config, record.sourceChain);
-  if (!chain) throw new Error(`No RPC/gateway configured for source chain "${record.sourceChain}".`);
-  const provider = makeProvider(chain.rpcUrl, config.rpcTimeoutMs);
-  const gateway = new ethers.Contract(chain.gatewayAddress, GATEWAY_ABI, provider);
-  const gatewayAddress = await gateway.getAddress();
-  // The ledger records the Xode beneficiary; the refund goes to whoever actually paid on the
-  // source chain, which only the deposit tx itself says.
-  const receipt = await provider.getTransactionReceipt(record.sourceTxHash);
-  const depositIndex = record.depositIndex ?? 0;
-  const log = receipt?.logs
-    .filter((l) => l.address.toLowerCase() === gatewayAddress.toLowerCase() && GATEWAY_DEPOSIT_TOPICS.includes(l.topics[0]))
-    .sort((a, b) => a.index - b.index)[depositIndex];
-  if (!log) throw new Error(`Couldn't find deposit event #${depositIndex} for ${record.sourceTxHash} on ${record.sourceChain}.`);
-  const event = gateway.interface.parseLog(log)!;
-  const payer: string = event.args.depositor;
-  // Gateways with recorded deposits refund through `refund(nonce, depositor, amount)`, which can only
-  // pay the original depositor; older ones need the owner's free-form withdraw.
-  let refundCall: RefundTarget["refundCall"];
-  try {
-    const recorded: string = await gateway.depositRecords(event.args.depositNonce);
-    if (recorded !== ethers.ZeroHash) {
-      refundCall = { to: gatewayAddress, data: gateway.interface.encodeFunctionData("refund", [event.args.depositNonce, payer, event.args.usdtAmount]) };
-    }
-  } catch {
-    // An older gateway without deposit records.
-  }
-  return { provider, payer, usdtAddress: await gateway.usdt(), heldBy: gatewayAddress, refundCall };
-}
 
 async function list(showAll: boolean): Promise<void> {
   const records = readLedger(config.ledgerFile);
@@ -145,24 +86,24 @@ async function mark(sourceTxHash: string | undefined, refundTxHash: string | und
   }
 
   const amount = BigInt(record.usdtAmount);
-  const target = await refundTarget(record);
+  let target: Awaited<ReturnType<typeof refundTarget>> | { payer: string; provider?: undefined };
+  try {
+    target = await refundTarget(record);
+  } catch (err) {
+    // E.g. the deposit sits on a gateway that has since been replaced, so it can't be looked up.
+    const to = option(process.argv.slice(2), "--to");
+    if (!force || !to || !ethers.isAddress(to)) throw new Error(`${err instanceof Error ? err.message : err}${force ? " - with --force, say who was refunded: --to <address>" : ""}`);
+    target = { payer: ethers.getAddress(to) };
+  }
 
-  if (!force) {
+  if (!force && target.provider) {
     // The refund must be a successful tx on the deposit's own chain that transfers at least the
     // deposit amount of the same USDT token back to the original payer.
     const receipt = await target.provider.getTransactionReceipt(refundTxHash);
     if (!receipt) throw new Error(`Refund tx ${refundTxHash} not found on ${record.sourceChain} (is it mined, and on the right chain?).`);
     if (receipt.status !== 1) throw new Error(`Refund tx ${refundTxHash} failed on-chain.`);
-    const refunded = receipt.logs
-      .filter((l) => l.address.toLowerCase() === target.usdtAddress.toLowerCase() && l.topics[0] === TRANSFER_TOPIC)
-      .filter((l) => ethers.getAddress(ethers.dataSlice(l.topics[2], 12)) === ethers.getAddress(target.payer))
-      .reduce((sum, l) => sum + ethers.toBigInt(l.data), 0n);
-    if (refunded < amount) {
-      throw new Error(
-        `Refund tx ${refundTxHash} sends ${usdt(refunded)} of USDT ${target.usdtAddress} to ${target.payer}, ` +
-        `less than the ${usdt(amount)} deposited. Use --force --note "..." if it was refunded another way.`,
-      );
-    }
+    const proof = refundProven(receipt.logs, target, amount);
+    if (!proof.ok) throw new Error(`Refund tx ${refundTxHash} doesn't refund ${record.sourceTxHash}: ${proof.reason}. Use --force --note "..." if it was refunded another way.`);
   }
 
   makeLedger(config.ledgerFile).record({

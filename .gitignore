@@ -5,3 +5,4 @@ node_modules/
 dist/
 setup.env
 setup.out.env
+safe-proposals/

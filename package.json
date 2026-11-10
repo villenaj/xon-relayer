@@ -21,7 +21,8 @@
     "setup": "tsx scripts/setup.ts",
     "test:e2e": "tsx test/e2e.manual.ts",
     "test:multi-buyer": "tsx test/multiBuyer.manual.ts",
-    "test:poison-pill": "tsx test/poisonPill.manual.ts"
+    "test:poison-pill": "tsx test/poisonPill.manual.ts",
+    "safe": "node dist/tools/safe.js"
   },
   "dependencies": {
     "@polkadot/api": "^16.5.1",

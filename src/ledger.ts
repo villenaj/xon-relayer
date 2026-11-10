@@ -37,7 +37,7 @@ export interface LedgerEntry {
 }
 
 /// An entry as stored on disk: amounts as decimal strings, plus the time it was written.
-export type LedgerRecord = Omit<LedgerEntry, "usdtAmount" | "minXonOut"> & { time: string; usdtAmount: string; minXonOut?: string };
+export type LedgerRecord = Omit<LedgerEntry, "usdtAmount" | "minXonOut"> & { time: string; usdtAmount: string; minXonOut?: string; gatewayNonce?: string };
 
 export interface Ledger {
   record(entry: LedgerEntry): void;
@@ -46,16 +46,13 @@ export interface Ledger {
 export function makeLedger(filePath: string): Ledger {
   return {
     record(entry) {
-      const line = JSON.stringify({
-        time: new Date().toISOString(),
-        ...entry,
-        usdtAmount: entry.usdtAmount.toString(),
-        ...(entry.minXonOut === undefined ? {} : { minXonOut: entry.minXonOut.toString() }),
-      });
-      // Never throws: a ledger write failure must not be mistaken for a settle failure by the
-      // adapter's error handling (which would stall that adapter's checkpoint on a deposit that
-      // actually did settle).
+      // Never throws - not even while serializing: a ledger write failure must not be mistaken for
+      // a settle failure by the adapter's error handling (which would stall that adapter on a
+      // deposit that actually did settle, or was correctly skipped). Amounts and any other bigint
+      // field (minXonOut, gatewayNonce...) are written as decimal strings.
+      let line = "";
       try {
+        line = JSON.stringify({ time: new Date().toISOString(), ...entry }, (_, value) => (typeof value === "bigint" ? value.toString() : value));
         const dir = dirname(filePath);
         if (dir !== "." && !existsSync(dir)) mkdirSync(dir, { recursive: true });
         // fsync each entry: a "settled" record lost to a power cut would later show up in
@@ -68,7 +65,7 @@ export function makeLedger(filePath: string): Ledger {
           closeSync(fd);
         }
       } catch (err) {
-        console.error(`[ledger] Failed to write to ${filePath}, entry was:`, line, err);
+        console.error(`[ledger] Failed to write to ${filePath}, entry was:`, line || entry, err);
       }
     },
   };

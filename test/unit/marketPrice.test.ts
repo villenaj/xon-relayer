@@ -14,6 +14,7 @@ import { depositIdAt, externalDepositId } from "../../src/settlement.js";
 import { diagnoseSwapFailure, type XodeDex } from "../../src/xodeDex.js";
 import { deviationBps, nextRate } from "../../src/rateKeeper.js";
 import { isAccountedByVending } from "../../src/adapters/accountedTransfers.js";
+const { refundProven } = await import("../../src/tools/refundTargets.js");
 import { fakeContext, quiet, revertError, tmpDir, vending } from "./helpers.js";
 import GATEWAY_ABI from "../../src/abi/EthUsdtGateway.json" with { type: "json" };
 import ERC20_ABI from "../../src/abi/IERC20.json" with { type: "json" };
@@ -298,5 +299,32 @@ test("a deposit refunded on the gateway is never paid out; older gateways withou
 
   const parsed = parseGatewayDeposit(gateway.interface, gatewayLog("Deposited", [DEPOSITOR, BENEFICIARY, 5_000_000n, 7n], "0xaa", 0), "ethereum");
   assert.equal(parsed?.gatewayNonce, 7n, "the gateway's own nonce is carried on the deposit");
+});
+
+test("a ledger entry carrying any bigint field is written, never thrown on", () => {
+  // Regression: gatewayNonce (a bigint) made JSON.stringify throw before the ledger's own error
+  // handling, so every poll that recorded a skipped gateway deposit failed and retried forever.
+  const file = path.join(tmpDir(), "ledger.jsonl");
+  const entry = { adapter: "ethereum", status: "skipped" as const, error: "MinimumNotMet", buyer: BENEFICIARY, usdtAmount: 2_000_000n, minXonOut: 10n ** 24n, gatewayNonce: 7n, sourceChain: "ethereum", sourceTxHash: "0xaa", depositId: "0x01", sourceBlock: 1 };
+  assert.doesNotThrow(() => makeLedger(file).record(entry));
+  const [r] = readLedger(file);
+  assert.deepEqual([r.usdtAmount, r.minXonOut, r.gatewayNonce, r.status], ["2000000", "1000000000000000000000000", "7", "skipped"]);
+});
+
+test("a refund is credited to a deposit only when the gateway's Refunded event names that deposit", () => {
+  const ev = new ethers.Interface(["event Refunded(uint256 indexed depositNonce, address indexed depositor, uint256 amount)", "event Transfer(address indexed from, address indexed to, uint256 value)"]);
+  const refunded = (nonce: bigint, amount: bigint) => ({ address: GATEWAY, ...ev.encodeEventLog("Refunded", [nonce, DEPOSITOR, amount]) });
+  const transfer = (amount: bigint) => ({ address: USDT, ...ev.encodeEventLog("Transfer", [GATEWAY, DEPOSITOR, amount]) });
+  const target = { payer: DEPOSITOR, usdtAddress: USDT, heldBy: GATEWAY, depositNonce: 3n, recordsDeposits: true };
+  // A batch that refunded deposits #2 and #4 of the same payer - plenty of USDT, but not #3.
+  const batch = [transfer(2_000_000n), refunded(2n, 2_000_000n), transfer(2_500_000n), refunded(4n, 2_500_000n)];
+  assert.equal(refundProven(batch, target, 1_500_000n).ok, false, "regression: the transfer sum alone once let this through");
+  assert.equal(refundProven([...batch, transfer(1_500_000n), refunded(3n, 1_500_000n)], target, 1_500_000n).ok, true);
+  assert.equal(refundProven([refunded(3n, 1_000_000n)], target, 1_500_000n).ok, false, "less than deposited");
+  assert.equal(refundProven([{ ...refunded(3n, 1_500_000n), address: USDT }], target, 1_500_000n).ok, false, "event from another contract");
+  // Gateways without deposit records (and Xode) fall back to the amount reaching the payer.
+  const older = { ...target, recordsDeposits: false };
+  assert.equal(refundProven([transfer(1_500_000n)], older, 1_500_000n).ok, true);
+  assert.equal(refundProven([transfer(1_000_000n)], older, 1_500_000n).ok, false);
 });
 
