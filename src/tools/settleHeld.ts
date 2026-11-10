@@ -15,7 +15,7 @@ import { config, loadRelayerKey, USDT_DECIMALS } from "../config.js";
 import { classifySettleError, describeError } from "../errorClassifier.js";
 import { makeLedger, readLedger } from "../ledger.js";
 import { createSettlementClient, depositIdAt, externalDepositId } from "../settlement.js";
-import { parseGatewayDeposit } from "../adapters/evmGatewayAdapter.js";
+import { isRefundedOnGateway, parseGatewayDeposit } from "../adapters/evmGatewayAdapter.js";
 import { externalChain, GATEWAY_DEPOSIT_TOPICS, option, runTool } from "./common.js";
 import GATEWAY_ABI from "../abi/EthUsdtGateway.json" with { type: "json" };
 
@@ -88,6 +88,9 @@ async function main(): Promise<void> {
     ...(minXonOut === undefined ? {} : { minXonOut }),
   };
 
+  if (await isRefundedOnGateway(gateway, deposit.gatewayNonce)) {
+    throw new Error(`Deposit #${depositIndex} of ${receipt.hash} was refunded on the gateway - it must not be paid out as well.`);
+  }
   if (await settlement.isExternalSettled(depositId)) {
     console.log("Already settled on-chain - nothing to do.");
     ledger.record({ ...entry, status: "already-settled" });

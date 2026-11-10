@@ -2,6 +2,8 @@
   "function usdt() view returns (address)",
   "function deposit(uint256 usdtAmount, address xodeBeneficiary)",
   "function depositForSwap(uint256 usdtAmount, address xodeBeneficiary, uint256 minXonOut)",
+  "function refund(uint256 nonce, address depositor, uint256 usdtAmount)",
+  "function depositRecords(uint256) view returns (bytes32)",
   "function depositNonce() view returns (uint256)",
   "event Deposited(address indexed depositor, address indexed xodeBeneficiary, uint256 usdtAmount, uint256 indexed depositNonce)",
   "event SwapDeposited(address indexed depositor, address indexed xodeBeneficiary, uint256 usdtAmount, uint256 indexed depositNonce, uint256 minXonOut)"

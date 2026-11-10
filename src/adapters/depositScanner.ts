@@ -27,6 +27,8 @@ export interface Deposit {
   /// Set for a market-price deposit (gateway `SwapDeposited`): the least XON (18-decimal units)
   /// the buyer accepts. Absent for a fixed-rate one.
   minXonOut?: bigint;
+  /// Gateway deposits: the gateway's own deposit nonce (from the event), which `refund` keys on.
+  gatewayNonce?: bigint;
 }
 
 /// A deposit as read from its log, before the scanner works out its position within the tx.

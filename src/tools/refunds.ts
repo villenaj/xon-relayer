@@ -2,8 +2,9 @@
 // ledger - e.g. ZeroAddress, XonTransferFailed, or a dust amount that rounds to 0 XON). Their USDT
 // is stuck in the vending contract (Xode deposits) or the gateway (AssetHub/Ethereum deposits),
 // and only that contract's *owner* can move it - deliberately not the relayer's key - so this
-// doesn't send refunds. It tells you who to refund and from where, and records a refund once
-// you've made it, after checking it on-chain.
+// doesn't send refunds. It tells you who to refund and from where - for a gateway with `refund`,
+// the exact call (target + calldata) to propose from the owner Safe, which can only pay the
+// original depositor - and records a refund once you've made it, after checking it on-chain.
 //
 // Usage:
 //   npm run refunds                                     list deposits awaiting a refund
@@ -30,6 +31,8 @@ interface RefundTarget {
   usdtAddress: string;
   /// The contract the USDT is sitting in; its owner has to send the refund.
   heldBy: string;
+  /// Gateways with `refund`: the owner's call that pays this deposit back to its depositor.
+  refundCall?: { to: string; data: string };
 }
 
 const usdt = (amount: bigint) => `${ethers.formatUnits(amount, USDT_DECIMALS)} USDT`;
@@ -67,8 +70,20 @@ async function refundTarget(record: LedgerRecord): Promise<RefundTarget> {
     .filter((l) => l.address.toLowerCase() === gatewayAddress.toLowerCase() && GATEWAY_DEPOSIT_TOPICS.includes(l.topics[0]))
     .sort((a, b) => a.index - b.index)[depositIndex];
   if (!log) throw new Error(`Couldn't find deposit event #${depositIndex} for ${record.sourceTxHash} on ${record.sourceChain}.`);
-  const payer: string = gateway.interface.parseLog(log)!.args.depositor;
-  return { provider, payer, usdtAddress: await gateway.usdt(), heldBy: gatewayAddress };
+  const event = gateway.interface.parseLog(log)!;
+  const payer: string = event.args.depositor;
+  // Gateways with recorded deposits refund through `refund(nonce, depositor, amount)`, which can only
+  // pay the original depositor; older ones need the owner's free-form withdraw.
+  let refundCall: RefundTarget["refundCall"];
+  try {
+    const recorded: string = await gateway.depositRecords(event.args.depositNonce);
+    if (recorded !== ethers.ZeroHash) {
+      refundCall = { to: gatewayAddress, data: gateway.interface.encodeFunctionData("refund", [event.args.depositNonce, payer, event.args.usdtAmount]) };
+    }
+  } catch {
+    // An older gateway without deposit records.
+  }
+  return { provider, payer, usdtAddress: await gateway.usdt(), heldBy: gatewayAddress, refundCall };
 }
 
 async function list(showAll: boolean): Promise<void> {
@@ -83,7 +98,12 @@ async function list(showAll: boolean): Promise<void> {
     console.log(`${r.sourceChain.padEnd(9)} ${r.sourceTxHash}${index}  ${usdt(BigInt(r.usdtAmount))}  (${r.error ?? "skipped"}, ${r.time})`);
     try {
       const t = await refundTarget(r);
-      console.log(`          refund ${usdt(BigInt(r.usdtAmount))} (token ${t.usdtAddress}) to ${t.payer} on ${r.sourceChain}, from ${t.heldBy} using its owner key`);
+      if (t.refundCall) {
+        console.log(`          refund ${usdt(BigInt(r.usdtAmount))} to ${t.payer} on ${r.sourceChain}: have the gateway owner (e.g. its Safe) call`);
+        console.log(`            to:   ${t.refundCall.to}\n            data: ${t.refundCall.data}`);
+      } else {
+        console.log(`          refund ${usdt(BigInt(r.usdtAmount))} (token ${t.usdtAddress}) to ${t.payer} on ${r.sourceChain}, from ${t.heldBy} using its owner key`);
+      }
     } catch (err) {
       console.log(`          couldn't work out the refund target: ${err instanceof Error ? err.message : err}`);
     }

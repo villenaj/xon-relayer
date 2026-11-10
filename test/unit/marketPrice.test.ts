@@ -7,7 +7,7 @@ import path from "node:path";
 import { readFileSync } from "node:fs";
 import { ethers, type JsonRpcProvider, type Log, type TransactionReceipt } from "ethers";
 import { createDepositScanner, type DepositSource } from "../../src/adapters/depositScanner.js";
-import { DEPOSITED_TOPIC, GATEWAY_DEPOSIT_TOPICS, parseGatewayDeposit, SWAP_DEPOSITED_TOPIC } from "../../src/adapters/evmGatewayAdapter.js";
+import { DEPOSITED_TOPIC, GATEWAY_DEPOSIT_TOPICS, isRefundedOnGateway, parseGatewayDeposit, SWAP_DEPOSITED_TOPIC } from "../../src/adapters/evmGatewayAdapter.js";
 import { classifySettleError } from "../../src/errorClassifier.js";
 import { makeLedger, readLedger } from "../../src/ledger.js";
 import { depositIdAt, externalDepositId } from "../../src/settlement.js";
@@ -285,5 +285,18 @@ test("the rate keeper steps toward the DEX price, within the contract's step and
   assert.equal(nextRate({ current: e("0.2"), target: 0n, ...step }), null);
   assert.equal(nextRate({ current: e("0.2"), target: e("0.3"), maxStepBps: 0n, deadbandBps: 50n }), null);
   assert.equal(deviationBps(e("0.21"), e("0.2")), 500n);
+});
+
+test("a deposit refunded on the gateway is never paid out; older gateways without records are unaffected", async () => {
+  const records: Record<string, string> = { "0": ethers.ZeroHash, "1": ethers.id("recorded") };
+  const gatewayWithRecords = { depositRecords: async (n: bigint) => records[n.toString()] ?? ethers.ZeroHash };
+  assert.equal(await isRefundedOnGateway(gatewayWithRecords as never, 0n), true, "record cleared by refund()");
+  assert.equal(await isRefundedOnGateway(gatewayWithRecords as never, 1n), false, "still recorded");
+  assert.equal(await isRefundedOnGateway(gatewayWithRecords as never, undefined), false, "no nonce known");
+  const olderGateway = { depositRecords: async () => { throw new Error("execution reverted"); } };
+  assert.equal(await isRefundedOnGateway(olderGateway as never, 0n), false);
+
+  const parsed = parseGatewayDeposit(gateway.interface, gatewayLog("Deposited", [DEPOSITOR, BENEFICIARY, 5_000_000n, 7n], "0xaa", 0), "ethereum");
+  assert.equal(parsed?.gatewayNonce, 7n, "the gateway's own nonce is carried on the deposit");
 });
 

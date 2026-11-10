@@ -85,7 +85,16 @@ export async function runEvmGatewayAdapter(options: EvmGatewayAdapterOptions): P
 
     parse: (log) => parseGatewayDeposit(gateway.interface, log, sourceChain),
     baseDepositId: (txHash) => externalDepositId(sourceChain, txHash),
-    isSettled: (d) => settlement.isExternalSettled(d.depositId),
+    // A deposit the gateway owner refunded must never be paid out as well: refund() clears its
+    // record on the gateway, and nothing tells Xode. Treat it as done.
+    isSettled: async (d) => {
+      if (await settlement.isExternalSettled(d.depositId)) return true;
+      if (await isRefundedOnGateway(gateway, d.gatewayNonce)) {
+        console.warn(`[${label}] ${d.sourceTxHash}${d.depositIndex > 0 ? ` #${d.depositIndex}` : ""} was refunded on the gateway - never paying it out.`);
+        return true;
+      }
+      return false;
+    },
     settle: (d) => d.minXonOut === undefined
       ? settlement.settleExternal(d.buyer, d.usdtAmount, sourceChain, d.depositId, label)
       : settlement.settleExternalSwap(d.buyer, d.usdtAmount, d.minXonOut, sourceChain, d.depositId, label),
@@ -114,8 +123,21 @@ export function parseGatewayDeposit(iface: ethers.Interface, log: ethers.Log, so
     sourceChain,
     sourceTxHash: log.transactionHash,
     sourceBlock: log.blockNumber,
+    gatewayNonce: parsed.args.depositNonce as bigint,
     ...(parsed.name === "SwapDeposited" ? { minXonOut: parsed.args.minXonOut as bigint } : {}),
   };
+}
+
+/// Whether the gateway refunded deposit `nonce` - its record is cleared by `refund` (and set, never
+/// zero, by every deposit). Gateways from before deposits were recorded have no `depositRecords`:
+/// the call reverts, and nothing counts as refunded there.
+export async function isRefundedOnGateway(gateway: { depositRecords(nonce: bigint): Promise<string> } | ethers.Contract, nonce: bigint | undefined): Promise<boolean> {
+  if (nonce === undefined) return false;
+  try {
+    return (await (gateway as { depositRecords(nonce: bigint): Promise<string> }).depositRecords(nonce)) === ethers.ZeroHash;
+  } catch {
+    return false;
+  }
 }
 
 /// A failed swap whose revert doesn't say why: no decodable data, or a plain `Error(string)` - what

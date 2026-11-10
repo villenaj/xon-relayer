@@ -64,6 +64,10 @@ const MAX_PER_DAY = usdt(env("EXTERNAL_MAX_PER_DAY_USDT", "1000"));
 const NATIVE_MAX_PER_PURCHASE = usdt(env("NATIVE_MAX_PER_PURCHASE_USDT", "100"));
 const NATIVE_MAX_PER_DAY = usdt(env("NATIVE_MAX_PER_DAY_USDT", "1000"));
 const RATE_KEEPER = flag("RATE_KEEPER", true);
+// Custody roles per chain (see contracts' Custodial.sol): where withdrawals go, and who can pause
+// and veto treasury changes. Each defaults to the contract owner - fine for development; in
+// production make them separate multisigs (e.g. a cold treasury Safe and a guardian Safe).
+const roleOf = (name: string, fallback: string): string => (process.env[name] ? ethers.getAddress(process.env[name]!) : fallback);
 const RATE_KEEPER_MAX_STEP_BPS = BigInt(env("RATE_KEEPER_MAX_STEP_BPS", "200")); // 2% per update
 const RATE_KEEPER_MIN_INTERVAL = BigInt(env("RATE_KEEPER_MIN_INTERVAL_SECONDS", "600"));
 
@@ -235,7 +239,7 @@ async function main(): Promise<void> {
   const xodeOwner = new ethers.NonceManager(owner.connect(xodeProvider));
   const xodeUsdt = precompileAddr(ASSET_ID);
   const vending = await deployOrReuse("xode: XonVendingMachine", loadArtifact("XonVendingMachine.sol/XonVendingMachine.json"), xodeOwner,
-    process.env.VENDING_ADDRESS, [xodeUsdt, owner.address, XON_RATE, relayer.address]);
+    process.env.VENDING_ADDRESS, [xodeUsdt, owner.address, XON_RATE, relayer.address, roleOf("XODE_TREASURY", owner.address), roleOf("XODE_GUARDIAN", owner.address)]);
   await requireOwner("xode", vending.contract, owner.address);
   if ((await vending.contract.relayer()) !== relayer.address) {
     await (await vending.contract.setRelayer(relayer.address)).wait();
@@ -279,7 +283,7 @@ async function main(): Promise<void> {
     }
     const ahOwner = new ethers.NonceManager(owner.connect(new ethers.JsonRpcProvider(ASSETHUB_EVM_RPC)));
     const gateway = await deployOrReuse("assethub: EthUsdtGateway", gatewayArtifact, ahOwner,
-      process.env.ASSETHUB_GATEWAY_ADDRESS, [precompileAddr(ASSET_ID), owner.address]);
+      process.env.ASSETHUB_GATEWAY_ADDRESS, [precompileAddr(ASSET_ID), owner.address, roleOf("ASSETHUB_TREASURY", owner.address), roleOf("ASSETHUB_GUARDIAN", owner.address)]);
     await requireOwner("assethub", gateway.contract, owner.address);
     Object.assign(out, { ASSETHUB_EVM_RPC, ASSETHUB_GATEWAY_ADDRESS: gateway.address });
     if (gateway.deployBlock !== undefined) out.ASSETHUB_START_BLOCK = String(gateway.deployBlock);
@@ -313,7 +317,7 @@ async function main(): Promise<void> {
       out.ETHEREUM_MOCK_USDT_ADDRESS = ethUsdt;
     }
     const gateway = await deployOrReuse("ethereum: EthUsdtGateway", gatewayArtifact, ethOwner,
-      process.env.ETH_GATEWAY_ADDRESS, [ethUsdt, owner.address]);
+      process.env.ETH_GATEWAY_ADDRESS, [ethUsdt, owner.address, roleOf("ETHEREUM_TREASURY", owner.address), roleOf("ETHEREUM_GUARDIAN", owner.address)]);
     await requireOwner("ethereum", gateway.contract, owner.address);
     Object.assign(out, { ETHEREUM_RPC, ETH_GATEWAY_ADDRESS: gateway.address });
     if (gateway.deployBlock !== undefined) out.ETHEREUM_START_BLOCK = String(gateway.deployBlock);
