@@ -12,6 +12,7 @@ import { runMonitor } from "./monitor.js";
 import { runXodeAdapter } from "./adapters/xodeAdapter.js";
 import { runAssetHubAdapter } from "./adapters/assetHubAdapter.js";
 import { runEthereumAdapter } from "./adapters/ethereumAdapter.js";
+import { connectXodeDex, type XodeDex } from "./xodeDex.js";
 
 async function main(): Promise<void> {
   validateConfig();
@@ -82,7 +83,22 @@ async function main(): Promise<void> {
     console.warn("MIN_RELAYER_BALANCE_XON / MIN_VENDING_RESERVE_XON not both set - no low-balance alert for the unset one.");
   }
 
-  const context = { settlement, config, ledger, limiter, telemetry, alerts, shutdown };
+  // Xode's DEX over Substrate RPC: tells a market-price deposit the pool can no longer pay (refund)
+  // from a swap that failed for a reason that clears up (paused, pool pending - retry).
+  let dex: XodeDex | null = null;
+  if (config.xodeSubstrateRpc) {
+    dex = await connectXodeDex(config.xodeSubstrateRpc);
+    console.log(`Diagnosing failed market-price swaps via ${config.xodeSubstrateRpc}`);
+  } else if (config.adapters.assetHub || config.adapters.ethereum) {
+    console.warn("XODE_SUBSTRATE_RPC is not set - a market-price (depositForSwap) deposit whose swap fails is retried forever, even when the pool can never meet its minimum. Set it to send those to the refund list.");
+  }
+  if (await settlement.usdtInventory() === null) {
+    console.warn("XonVendingMachine predates market-price payouts (no accountedUsdt) - depositForSwap deposits will fail to settle until it's redeployed.");
+  } else if (config.minUsdtInventory === null) {
+    console.warn("MIN_USDT_INVENTORY not set - no alert when the USDT inventory for market-price payouts runs low.");
+  }
+
+  const context = { settlement, config, ledger, limiter, telemetry, alerts, shutdown, dex };
   const adapters: Promise<void>[] = [];
   if (config.adapters.xode) adapters.push(runXodeAdapter(context));
   if (config.adapters.assetHub) adapters.push(runAssetHubAdapter(context));
@@ -98,6 +114,7 @@ async function main(): Promise<void> {
   await Promise.all([...adapters, runMonitor(context)]);
 
   server?.close();
+  await dex?.disconnect();
   console.log("Shut down cleanly.");
 }
 

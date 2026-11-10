@@ -102,6 +102,10 @@ export const config = {
   // Optional, but set them in production: the relayer refuses to start if an RPC reports a
   // different chain, so a testnet RPC can't be paired with mainnet addresses (or vice versa).
   xodeChainId: optionalChainId("XODE_CHAIN_ID"),
+  // Xode's Substrate RPC (ws:// or wss://), for market-price payouts: the front-end API quotes
+  // swaps from the DEX with it, and the relayer asks it why a swap failed (paused, pool pending, or
+  // below the buyer's minimum - see xodeDex.ts). Without it, failed swaps are only ever retried.
+  xodeSubstrateRpc: process.env.XODE_SUBSTRATE_RPC || null,
   rpcTimeoutMs: Number(process.env.RPC_TIMEOUT_MS ?? DEFAULT_RPC_TIMEOUT_MS),
 
   pollIntervalMs: Number(process.env.POLL_INTERVAL_MS ?? 5000),
@@ -139,6 +143,8 @@ export const config = {
   monitorIntervalMs: Number(process.env.MONITOR_INTERVAL_MS ?? 60_000),
   minRelayerBalance: optionalXon("MIN_RELAYER_BALANCE_XON"),
   minVendingReserve: optionalXon("MIN_VENDING_RESERVE_XON"),
+  // USDT the vending contract holds for market-price payouts (`accountedUsdt`); below this, alert.
+  minUsdtInventory: optionalUsdt("MIN_USDT_INVENTORY"),
   // Optional chat webhook (Slack/Discord/Mattermost-style) that alerts are POSTed to.
   alertWebhookUrl: process.env.ALERT_WEBHOOK_URL || null,
 
@@ -215,6 +221,9 @@ export function validateConfig(): void {
   }
   if (!Number.isInteger(config.apiPort) || config.apiPort < 1 || config.apiPort > 65535) {
     throw new Error(`API_PORT must be a port number (got "${process.env.API_PORT}").`);
+  }
+  if (config.xodeSubstrateRpc && !/^wss?:\/\//.test(config.xodeSubstrateRpc)) {
+    throw new Error(`XODE_SUBSTRATE_RPC must be a ws:// or wss:// URL (got "${config.xodeSubstrateRpc}").`);
   }
   const addresses = {
     VENDING_ADDRESS: config.vendingAddress,

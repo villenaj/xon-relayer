@@ -199,6 +199,23 @@ export async function createSettlementClient({ xodeEthRpc, vendingAddress, relay
       console.log(`[${label}] Settled ${depositId} in block ${receipt.blockNumber} (settle tx ${receipt.hash}).`);
       return receipt;
     },
+    /// Market-price version (gateway `depositForSwap`): swaps the vending contract's USDT inventory
+    /// for XON on Xode's DEX and pays the buyer the result, if it's at least `minXonOut`.
+    async settleExternalSwap(buyer: string, usdtAmount: bigint, minXonOut: bigint, sourceChain: string, depositId: string, label: string): Promise<TransactionReceipt> {
+      console.log(`[${label}] New swap deposit: ${buyer} paid ${usdtAmount.toString()} USDT on ${sourceChain}, minimum ${ethers.formatEther(minXonOut)} XON (id ${depositId}). Settling...`);
+      const receipt = await sendAndConfirm(sender, label, () => vending.settleExternalSwap(buyer, usdtAmount, minXonOut, sourceChain, depositId));
+      console.log(`[${label}] Settled ${depositId} at market price in block ${receipt.blockNumber} (settle tx ${receipt.hash}).`);
+      return receipt;
+    },
+    /// USDT the vending contract holds for market-price payouts (raw units), or null if the
+    /// deployed contract predates them.
+    async usdtInventory(): Promise<bigint | null> {
+      try {
+        return await vending.accountedUsdt();
+      } catch {
+        return null;
+      }
+    },
   };
 }
 

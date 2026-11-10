@@ -26,6 +26,8 @@ export interface LedgerEntry {
   depositIndex?: number;
   depositId: string;
   sourceBlock: number;
+  /// Market-price deposits only: the buyer's minimum, in XON's 18-decimal units.
+  minXonOut?: bigint;
   settleTxHash?: string;
   settleBlock?: number;
   refundTxHash?: string;
@@ -35,7 +37,7 @@ export interface LedgerEntry {
 }
 
 /// An entry as stored on disk: amounts as decimal strings, plus the time it was written.
-export type LedgerRecord = Omit<LedgerEntry, "usdtAmount"> & { time: string; usdtAmount: string };
+export type LedgerRecord = Omit<LedgerEntry, "usdtAmount" | "minXonOut"> & { time: string; usdtAmount: string; minXonOut?: string };
 
 export interface Ledger {
   record(entry: LedgerEntry): void;
@@ -44,7 +46,12 @@ export interface Ledger {
 export function makeLedger(filePath: string): Ledger {
   return {
     record(entry) {
-      const line = JSON.stringify({ time: new Date().toISOString(), ...entry, usdtAmount: entry.usdtAmount.toString() });
+      const line = JSON.stringify({
+        time: new Date().toISOString(),
+        ...entry,
+        usdtAmount: entry.usdtAmount.toString(),
+        ...(entry.minXonOut === undefined ? {} : { minXonOut: entry.minXonOut.toString() }),
+      });
       // Never throws: a ledger write failure must not be mistaken for a settle failure by the
       // adapter's error handling (which would stall that adapter's checkpoint on a deposit that
       // actually did settle).

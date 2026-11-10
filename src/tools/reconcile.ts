@@ -1,7 +1,7 @@
 // Operator command: cross-checks the ledger against the chains, read-only. Exits 1 if it finds a
 // problem, so it can run from cron and alert on failure.
 //
-//   1. Payouts: every Settled / ExternalSettled event XonVendingMachine emitted vs the ledger's
+//   1. Payouts: every Settled / ExternalSettled / ExternalSwapSettled event XonVendingMachine emitted vs the ledger's
 //      "settled" entries - a payout the ledger never recorded (another process with the relayer
 //      key?), a ledger "settled" with no payout behind it, or the two disagreeing on recipient or
 //      amount.
@@ -21,12 +21,13 @@ import { makeCheckpoint } from "../checkpoint.js";
 import { config, USDT_DECIMALS } from "../config.js";
 import { readLedger, type LedgerRecord, type LedgerStatus } from "../ledger.js";
 import { depositIdAt, externalDepositId } from "../settlement.js";
-import { blockOption, DEPOSITED_TOPIC, externalChains, runTool, TRANSFER_TOPIC } from "./common.js";
+import { isAccountedByVending } from "../adapters/accountedTransfers.js";
+import { blockOption, externalChains, GATEWAY_DEPOSIT_TOPICS, runTool, TRANSFER_TOPIC } from "./common.js";
 import GATEWAY_ABI from "../abi/EthUsdtGateway.json" with { type: "json" };
 import VENDING_ABI from "../abi/XonVendingMachine.json" with { type: "json" };
 
 interface Payout {
-  kind: "Settled" | "ExternalSettled";
+  kind: "Settled" | "ExternalSettled" | "ExternalSwapSettled";
   buyer: string;
   usdtIn: bigint;
   xonOut: bigint;
@@ -39,7 +40,7 @@ const notes: string[] = [];
 const usdt = (amount: bigint) => `${ethers.formatUnits(amount, USDT_DECIMALS)} USDT`;
 const key = (hash: string) => hash.toLowerCase();
 
-async function collectLogs(provider: ethers.JsonRpcProvider, address: string, topic: string, from: number, to: number): Promise<Log[]> {
+async function collectLogs(provider: ethers.JsonRpcProvider, address: string, topic: string | string[], from: number, to: number): Promise<Log[]> {
   const all: Log[] = [];
   await scanLogs({ provider, address, topic, chunkSize: config.logChunkSize }, from, to, async (logs) => {
     all.push(...logs);
@@ -102,7 +103,7 @@ runTool(async () => {
     notes.push("Payouts: no --xode-from, XODE_START_BLOCK or ledger history to start from - not checked.");
   } else {
     const latest = await xode.getBlockNumber();
-    for (const topic of [vending.interface.getEvent("Settled")!.topicHash, vending.interface.getEvent("ExternalSettled")!.topicHash]) {
+    for (const topic of ["Settled", "ExternalSettled", "ExternalSwapSettled"].map((name) => vending.interface.getEvent(name)!.topicHash)) {
       for (const log of await collectLogs(xode, vendingAddress, topic, xodeFrom, latest)) {
         const e = vending.interface.parseLog(log)!;
         const depositId: string = e.name === "Settled" ? e.args.depositTxHash : e.args.depositId;
@@ -170,6 +171,8 @@ runTool(async () => {
       const deposits = (await collectLogs(xode, usdtAddress, TRANSFER_TOPIC, from, to)).filter((l) => key(l.topics[2]) === paddedVending);
       for (const { log, index } of withDepositIndex(deposits)) {
         const depositId = depositIdAt(log.transactionHash, index);
+        // buy() / fundUsdtInventory(): the contract accounted for this USDT itself - not a deposit.
+        if (await isAccountedByVending(xode, vendingAddress, log.transactionHash)) continue;
         const settled: boolean = await vending.settledDeposits(depositId);
         await checkDeposit("xode", depositId, log.transactionHash, index, ethers.toBigInt(log.data), settled);
       }
@@ -195,7 +198,8 @@ runTool(async () => {
       continue;
     }
 
-    const logs = await collectLogs(provider, gatewayAddress, DEPOSITED_TOPIC, from, to);
+    // Both kinds of deposit, numbered together within a tx as the relayer does.
+    const logs = await collectLogs(provider, gatewayAddress, GATEWAY_DEPOSIT_TOPICS, from, to);
     for (const { log, index } of withDepositIndex(logs)) {
       const amount: bigint = gateway.interface.parseLog(log)!.args.usdtAmount;
       const depositId = depositIdAt(externalDepositId(chain.name, log.transactionHash), index);

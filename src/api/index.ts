@@ -9,6 +9,7 @@ import { connectNetworks } from "./networks.js";
 import { openApiSpec, swaggerHtml } from "./openapi.js";
 import { followTx, makeScanners } from "./scanner.js";
 import { makeApiService } from "./service.js";
+import { connectXodeDex } from "../xodeDex.js";
 import { parseAddress } from "./transactions.js";
 
 /// Most addresses one watch stream may follow.
@@ -36,7 +37,10 @@ async function main(): Promise<void> {
   const networks = await connectNetworks(config);
   for (const net of networks.byName.values()) console.log(`[api] ${net.name}: chain ${net.chainId}, USDT ${net.usdtAddress}, pays into ${net.payTo}`);
 
-  const service = makeApiService(config, networks);
+  // Xode's DEX over Substrate RPC, for market-price quotes - optional (see XODE_SUBSTRATE_RPC).
+  const dex = config.xodeSubstrateRpc ? await connectXodeDex(config.xodeSubstrateRpc) : null;
+  if (!dex) console.warn("[api] XODE_SUBSTRATE_RPC not set - no market-price quotes; market-price purchases need an explicit minXonOut.");
+  const service = makeApiService(config, networks, dex);
   const streams = new StreamRegistry(config.apiMaxStreams);
   const scanners = makeScanners(networks, config.apiPollIntervalMs);
 
@@ -62,7 +66,7 @@ async function main(): Promise<void> {
     },
     { method: "GET", path: "/api/config", handler: () => service.info() },
     { method: "GET", path: "/api/limits", handler: () => service.limits() },
-    { method: "GET", path: "/api/quote", handler: async ({ query }) => service.quote(query.get("amount"), query.get("network")) },
+    { method: "GET", path: "/api/quote", handler: async ({ query }) => service.quote(query.get("amount"), query.get("network"), query.get("slippageBps")) },
     { method: "GET", path: "/api/balances/:address", handler: ({ params, query }) => service.balances(params.address, list(query.get("networks"))) },
     { method: "GET", path: "/api/allowance/:network/:address", handler: ({ params }) => service.allowance(params.network, params.address) },
     { method: "GET", path: "/api/deposits/:address", handler: async ({ params }) => service.deposits(params.address) },

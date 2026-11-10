@@ -11,7 +11,7 @@ import type { JsonRpcProvider, Log, TransactionReceipt } from "ethers";
 import path from "node:path";
 import { describeConfirmations, getSafeHead, scanLogs, type Confirmations } from "../chain.js";
 import { makeCheckpoint } from "../checkpoint.js";
-import { classifySettleError, describeError } from "../errorClassifier.js";
+import { classifySettleError, describeError, type SettleErrorClassification } from "../errorClassifier.js";
 import { depositIdAt } from "../settlement.js";
 import type { AdapterContext } from "./types.js";
 
@@ -24,6 +24,9 @@ export interface Deposit {
   depositIndex: number;
   depositId: string;
   sourceBlock: number;
+  /// Set for a market-price deposit (gateway `SwapDeposited`): the least XON (18-decimal units)
+  /// the buyer accepts. Absent for a fixed-rate one.
+  minXonOut?: bigint;
 }
 
 /// A deposit as read from its log, before the scanner works out its position within the tx.
@@ -40,9 +43,9 @@ export interface DepositSource {
   /// Shown in the startup log line, e.g. "USDT (0x...) transfers into 0x...".
   description: string;
   provider: JsonRpcProvider;
-  /// Contract whose logs carry the deposits, and the event topic to fetch.
+  /// Contract whose logs carry the deposits, and the event topic(s) to fetch (several: any of them).
   logAddress: string;
-  topic: string;
+  topic: string | string[];
   confirmations: Confirmations;
   checkpointFile: string;
   checkpointIdentity: string;
@@ -56,6 +59,9 @@ export interface DepositSource {
   isSettled(deposit: Deposit): Promise<boolean>;
   settle(deposit: Deposit): Promise<TransactionReceipt>;
   gate?(deposit: Deposit): Gate;
+  /// A second look at a failed settle the revert data couldn't explain (a market-price swap fails
+  /// with the XCM precompile's generic error, whatever the cause). Return null to keep the default.
+  diagnose?(deposit: Deposit, failure: SettleErrorClassification): Promise<(SettleErrorClassification & { detail: string }) | null>;
 }
 
 export interface DepositScanner {
@@ -123,8 +129,29 @@ export async function createDepositScanner(context: AdapterContext, source: Depo
         const receipt = await source.settle(deposit);
         ledger.record({ ...entry, status: "settled", settleTxHash: receipt.hash, settleBlock: receipt.blockNumber });
       } catch (err) {
+        // A settle that errored may still have landed: the RPC can lose the receipt (Xode's
+        // eth-rpc does for blocks it fails to decode, e.g. after a runtime upgrade until it's
+        // restarted). Ask the contract before anything else - a paid deposit recorded as skipped
+        // would go on the refund list and be paid twice. Keep its cap reservation: it was paid.
+        if (await source.isSettled(deposit).catch(() => false)) {
+          console.warn(`[${label}] Settling ${tx} reported an error, but it's settled on-chain - recording it as already settled:`, describeError(err));
+          ledger.record({ ...entry, status: "already-settled", error: "SettledDespiteError", message: describeError(err) });
+          continue;
+        }
         gate.release?.();
-        const { kind, name } = classifySettleError(settlement.vending, err);
+        let { kind, name } = classifySettleError(settlement.vending, err);
+        if (kind === "transient" && source.diagnose) {
+          try {
+            const diagnosis = await source.diagnose(deposit, { kind, name });
+            if (diagnosis) {
+              console.warn(`[${label}] ${tx}: ${diagnosis.detail}.`);
+              ({ kind, name } = diagnosis);
+            }
+          } catch (diagnoseErr) {
+            // Can't tell why - keep retrying rather than give up on the deposit.
+            console.error(`[${label}] Couldn't diagnose the failed settle of ${tx}:`, describeError(diagnoseErr));
+          }
+        }
         if (kind === "already-done") {
           console.log(`[${label}] ${tx} was already settled by another attempt (${name}) - continuing.`);
           ledger.record({ ...entry, status: "already-settled", error: name });

@@ -1,6 +1,8 @@
-// Watches `UsdtGateway.Deposited` events on any EVM-compatible chain other than Xode itself
-// (Ethereum, or AssetHub now that it runs pallet-revive) and settles the corresponding XON payout
-// on Xode. One instance of this adapter runs per such chain - see ethereumAdapter.ts and
+// Watches `UsdtGateway.Deposited` and `SwapDeposited` events on any EVM-compatible chain other
+// than Xode itself (Ethereum, or AssetHub now that it runs pallet-revive) and settles the
+// corresponding XON payout on Xode: at the vending contract's fixed rate for `Deposited`
+// (settleExternalPurchase), at the DEX's market price for `SwapDeposited` (settleExternalSwap,
+// with the buyer's own minimum - a deposit the pool can no longer meet goes to the refund list). One instance of this adapter runs per such chain - see ethereumAdapter.ts and
 // assetHubAdapter.ts, which are both just this function called with a different chain config.
 //
 // This is a custodial leg regardless of which chain it watches: USDT deposited into the gateway
@@ -12,11 +14,15 @@ import { ethers } from "ethers";
 import { makeProvider, verifyEndpoint, type Confirmations } from "../chain.js";
 import { USDT_DECIMALS } from "../config.js";
 import { externalDepositId } from "../settlement.js";
-import { runDepositScanner, type Deposit, type Gate } from "./depositScanner.js";
+import { diagnoseSwapFailure } from "../xodeDex.js";
+import { runDepositScanner, type Deposit, type Gate, type ParsedDeposit } from "./depositScanner.js";
 import type { AdapterContext } from "./types.js";
 import GATEWAY_ABI from "../abi/EthUsdtGateway.json" with { type: "json" };
 
-const DEPOSITED_TOPIC = ethers.id("Deposited(address,address,uint256,uint256)");
+export const DEPOSITED_TOPIC = ethers.id("Deposited(address,address,uint256,uint256)");
+export const SWAP_DEPOSITED_TOPIC = ethers.id("SwapDeposited(address,address,uint256,uint256,uint256)");
+/// Both deposit events: the relayer numbers a tx's deposits across the two, in log order.
+export const GATEWAY_DEPOSIT_TOPICS = [DEPOSITED_TOPIC, SWAP_DEPOSITED_TOPIC];
 
 export interface EvmGatewayAdapterOptions extends AdapterContext {
   sourceChain: string;
@@ -32,7 +38,7 @@ export interface EvmGatewayAdapterOptions extends AdapterContext {
 }
 
 export async function runEvmGatewayAdapter(options: EvmGatewayAdapterOptions): Promise<void> {
-  const { settlement, ledger, limiter, alerts, sourceChain, label, rpcUrl } = options;
+  const { settlement, ledger, limiter, alerts, dex, sourceChain, label, rpcUrl } = options;
   const provider = makeProvider(rpcUrl, options.config.rpcTimeoutMs);
   await verifyEndpoint(provider, { label, expectedChainId: options.expectedChainId, contracts: { UsdtGateway: options.gatewayAddress } });
   const gateway = new ethers.Contract(options.gatewayAddress, GATEWAY_ABI, provider);
@@ -70,27 +76,50 @@ export async function runEvmGatewayAdapter(options: EvmGatewayAdapterOptions): P
     description: `UsdtGateway (${gatewayAddress}) deposits on ${rpcUrl}`,
     provider,
     logAddress: gatewayAddress,
-    topic: DEPOSITED_TOPIC,
+    topic: GATEWAY_DEPOSIT_TOPICS,
     confirmations: options.confirmations,
     checkpointFile: options.checkpointFile,
     checkpointIdentity: gatewayAddress,
     startBlock: options.startBlock,
     startBlockName: options.startBlockName,
 
-    parse(log) {
-      const parsed = gateway.interface.parseLog(log);
-      if (!parsed) return null;
-      return {
-        buyer: parsed.args.xodeBeneficiary,
-        usdtAmount: parsed.args.usdtAmount,
-        sourceChain,
-        sourceTxHash: log.transactionHash,
-        sourceBlock: log.blockNumber,
-      };
-    },
+    parse: (log) => parseGatewayDeposit(gateway.interface, log, sourceChain),
     baseDepositId: (txHash) => externalDepositId(sourceChain, txHash),
     isSettled: (d) => settlement.isExternalSettled(d.depositId),
-    settle: (d) => settlement.settleExternal(d.buyer, d.usdtAmount, sourceChain, d.depositId, label),
+    settle: (d) => d.minXonOut === undefined
+      ? settlement.settleExternal(d.buyer, d.usdtAmount, sourceChain, d.depositId, label)
+      : settlement.settleExternalSwap(d.buyer, d.usdtAmount, d.minXonOut, sourceChain, d.depositId, label),
     gate,
+    // A market-price swap that fails reverts with the XCM precompile's generic error - ask Xode's
+    // DEX why, so a deposit the pool can no longer meet is refunded instead of retried forever.
+    async diagnose(d, failure) {
+      if (d.minXonOut === undefined || !isUnexplainedSwapFailure(failure.name)) return null;
+      const diagnosis = await diagnoseSwapFailure(dex, d.usdtAmount, d.minXonOut);
+      if (diagnosis.kind === "permanent") {
+        alerts.send(`[${label}] Swap deposit ${d.sourceTxHash}${d.depositIndex > 0 ? ` #${d.depositIndex}` : ""} can't be paid: ${diagnosis.detail}. It's on the refund list (npm run refunds).`);
+      }
+      return diagnosis;
+    },
   });
+}
+
+/// A gateway deposit log as the scanner's ParsedDeposit - `minXonOut` set for `SwapDeposited`.
+export function parseGatewayDeposit(iface: ethers.Interface, log: ethers.Log, sourceChain: string): ParsedDeposit | null {
+  if (log.topics[0] !== DEPOSITED_TOPIC && log.topics[0] !== SWAP_DEPOSITED_TOPIC) return null;
+  const parsed = iface.parseLog(log);
+  if (!parsed) return null;
+  return {
+    buyer: parsed.args.xodeBeneficiary,
+    usdtAmount: parsed.args.usdtAmount,
+    sourceChain,
+    sourceTxHash: log.transactionHash,
+    sourceBlock: log.blockNumber,
+    ...(parsed.name === "SwapDeposited" ? { minXonOut: parsed.args.minXonOut as bigint } : {}),
+  };
+}
+
+/// A failed swap whose revert doesn't say why: no decodable data, or a plain `Error(string)` - what
+/// Xode's XCM precompile reverts with for any failed XCM program.
+function isUnexplainedSwapFailure(name: string | null): boolean {
+  return name === null || name === "Error";
 }

@@ -5,7 +5,8 @@ import type { Confirmations } from "../chain.js";
 import type { Config } from "../config.js";
 
 export const TRANSFER_TOPIC = ethers.id("Transfer(address,address,uint256)");
-export const DEPOSITED_TOPIC = ethers.id("Deposited(address,address,uint256,uint256)");
+// Gateway deposit events: fixed-rate `Deposited` and market-price `SwapDeposited`.
+export { DEPOSITED_TOPIC, GATEWAY_DEPOSIT_TOPICS, SWAP_DEPOSITED_TOPIC } from "../adapters/evmGatewayAdapter.js";
 
 export type ExternalChainName = "assethub" | "ethereum";
 

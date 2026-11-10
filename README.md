@@ -126,6 +126,41 @@ older contract). If a deposit goes over the on-chain limits anyway:
 - Over the daily allowance (`OverExternalDailyLimit`): the adapter retries until the allowance
   refills.
 
+## Market-price payouts
+
+AssetHub and Ethereum buyers can choose between two prices:
+
+- **Fixed rate** - gateway `deposit` -> `settleExternalPurchase`: XON from the vending contract's
+  reserve at its owner-set `rate`. Unchanged.
+- **Market price** - gateway `depositForSwap(amount, beneficiary, minXonOut)` ->
+  `settleExternalSwap`: the vending contract spends the same amount of its own USDT inventory on
+  Xode, swaps it for XON through Xode's DEX (the XCM precompile and the runtime's XCM
+  `AssetExchanger`, spec 17+), and pays the buyer whatever the swap returned. `minXonOut` is the
+  buyer's own minimum, recorded in the deposit event; if the pool can't give that much, the swap
+  reverts and nothing is paid.
+
+The relayer settles each deposit by the event it came from (`Deposited` or `SwapDeposited`), so both
+work side by side. Market-price payouts are bounded by the same external limits and caps, and need:
+
+- a vending contract with `settleExternalSwap` (it warns at startup if not), and USDT inventory in
+  it - the owner adds it with `fundUsdtInventory`. Set `MIN_USDT_INVENTORY` to be alerted before it
+  runs out; meanwhile those deposits stall on `InsufficientUsdtInventory` and resume once it's
+  topped up. The USDT buyers pay accumulates in the gateways, so move it back periodically.
+- `XODE_SUBSTRATE_RPC` (Xode's ws/wss endpoint). When a swap fails, Xode's XCM precompile reverts
+  with the same generic message whatever the reason, so the relayer asks the chain:
+
+  | Cause | What the relayer does |
+  | --- | --- |
+  | Swaps paused by governance (`TxPause`) | Retries until they're unpaused (`SwapsPaused`) |
+  | Pool not approved yet (`AssetWaiting` Pending) | Retries (`PoolNotActive`) |
+  | Pool now gives less than the buyer's minimum | **Skips** it with `MinimumNotMet` and alerts - it's on the refund list |
+  | Anything else | Retries (`SwapFailed`) |
+
+  Without `XODE_SUBSTRATE_RPC` every failed swap is retried, including one the pool can never
+  meet, which stalls the adapter behind it.
+
+`settle-held` releases a held market-price deposit as a swap with its original minimum.
+
 ## Transaction ledger
 
 Every settle attempt is appended to `.checkpoints/ledger.jsonl` (override with `LEDGER_FILE`), one
@@ -139,7 +174,8 @@ JSON object per line:
 
 - `settled` - XON paid out; `settleTxHash` / `settleBlock` point at the settle tx on Xode.
 - `already-settled` - another attempt had already settled this deposit.
-- `skipped` - reverted with a permanent error (`error`, e.g. `ZeroAmount`) and will never be retried.
+- `skipped` - reverted with a permanent error (`error`, e.g. `ZeroAmount`, or `MinimumNotMet` for a
+  market-price deposit the pool couldn't pay) and will never be retried.
 - `held` - over a payout cap, the relayer's or the contract's (`error` says which); waits for
   `npm run settle-held` (see Payout caps).
 - `refunded` - a `skipped` deposit's USDT was returned to the payer (`refundTxHash` / `refundTo`).
@@ -163,8 +199,8 @@ jq -c 'select(.buyer == "0xYourAddress")' .checkpoints/ledger.jsonl
 
 ## Refunds
 
-A `skipped` deposit (e.g. `ZeroAddress`, `XonTransferFailed`, or a dust amount that rounds to 0
-XON) can never be paid out, so its USDT is stuck: in the vending contract for a Xode deposit, in
+A `skipped` deposit (e.g. `ZeroAddress`, `XonTransferFailed`, a dust amount that rounds to 0
+XON, or a market-price deposit whose minimum the pool couldn't meet) can never be paid out, so its USDT is stuck: in the vending contract for a Xode deposit, in
 the gateway for an AssetHub/Ethereum one. Only that contract's **owner** can move it - not the
 relayer's key, on purpose - so the relayer doesn't send refunds; it tracks them:
 
@@ -250,12 +286,12 @@ are `{ "error": "<Code>", "message": "..." }` with a 4xx status, or 502 when a c
 | --- | --- |
 | `GET /api/config` | Networks (chain ID, USDT address, the contract USDT is paid into, `flow`: `transfer` or `approve-deposit`), the XON rate, and the external payout limits. Call it once at startup. |
 | `GET /api/limits` | The vending contract's XON reserve, and the on-chain and relayer payout limits, including how much of today's allowance is left. |
-| `GET /api/quote?amount=10&network=ethereum` | XON for that much USDT, plus `warnings` if the payout would be delayed or held for review. |
+| `GET /api/quote?amount=10&network=ethereum[&slippageBps=100]` | XON for that much USDT at the fixed rate, plus `warnings` if the payout would be delayed or held for review. On AssetHub/Ethereum, `swap` adds the market-price quote and the minimum that slippage would set (needs `XODE_SUBSTRATE_RPC`). |
 | `GET /api/balances/:address?networks=xode,ethereum` | Native and USDT balance on each network, and the gateway allowance where one is needed. |
 | `GET /api/allowance/:network/:address` | How much USDT the gateway may take from the address. |
-| `POST /api/tx/buy` | `{ network, from, amount, beneficiary? }` returns every transaction the purchase needs, in order: one USDT transfer on Xode, or approve (if needed) then deposit elsewhere. `beneficiary` (default `from`) is who gets the XON. On Xode it's always the sender. |
+| `POST /api/tx/buy` | `{ network, from, amount, beneficiary?, minXonOut?, slippageBps? }` returns every transaction the purchase needs, in order: one USDT transfer on Xode, or approve (if needed) then deposit elsewhere. `beneficiary` (default `from`) is who gets the XON. On Xode it's always the sender. With `minXonOut` (an XON amount) or `slippageBps`, the deposit is a `depositForSwap`, paid at market price (`payout: "swap"`). |
 | `POST /api/tx/approve` | `{ network, from, amount }` returns only the approval (`amount: "max"` for unlimited). On Ethereum, a non-zero allowance is reset to 0 first, because USDT there requires it. |
-| `POST /api/tx/deposit` | `{ network, from, amount, beneficiary? }` returns only the gateway deposit. It refuses if the allowance or balance is too low. |
+| `POST /api/tx/deposit` | `{ network, from, amount, beneficiary?, minXonOut?, slippageBps? }` returns only the gateway deposit (`depositForSwap` with a minimum, as for `buy`). It refuses if the allowance or balance is too low. |
 | `POST /api/tx/broadcast` | `{ network, signedTx }` sends a transaction the wallet signed but didn't send. It only accepts transactions to that network's USDT or gateway/vending contract. |
 | `GET /api/tx/:network/:hash` | The receipt, confirmation status and, for a purchase, each deposit's state and payout tx. |
 | `GET /api/tx/:network/:hash/events` | Event stream following the transaction until it's done (see below). |

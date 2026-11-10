@@ -19,7 +19,7 @@ import { ethers } from "ethers";
 import { makeProvider } from "../chain.js";
 import { config, USDT_DECIMALS } from "../config.js";
 import { makeLedger, readLedger, type LedgerRecord } from "../ledger.js";
-import { DEPOSITED_TOPIC, externalChain, option, runTool, TRANSFER_TOPIC } from "./common.js";
+import { externalChain, GATEWAY_DEPOSIT_TOPICS, option, runTool, TRANSFER_TOPIC } from "./common.js";
 import GATEWAY_ABI from "../abi/EthUsdtGateway.json" with { type: "json" };
 import VENDING_ABI from "../abi/XonVendingMachine.json" with { type: "json" };
 
@@ -64,9 +64,9 @@ async function refundTarget(record: LedgerRecord): Promise<RefundTarget> {
   const receipt = await provider.getTransactionReceipt(record.sourceTxHash);
   const depositIndex = record.depositIndex ?? 0;
   const log = receipt?.logs
-    .filter((l) => l.address.toLowerCase() === gatewayAddress.toLowerCase() && l.topics[0] === DEPOSITED_TOPIC)
+    .filter((l) => l.address.toLowerCase() === gatewayAddress.toLowerCase() && GATEWAY_DEPOSIT_TOPICS.includes(l.topics[0]))
     .sort((a, b) => a.index - b.index)[depositIndex];
-  if (!log) throw new Error(`Couldn't find Deposited event #${depositIndex} for ${record.sourceTxHash} on ${record.sourceChain}.`);
+  if (!log) throw new Error(`Couldn't find deposit event #${depositIndex} for ${record.sourceTxHash} on ${record.sourceChain}.`);
   const payer: string = gateway.interface.parseLog(log)!.args.depositor;
   return { provider, payer, usdtAddress: await gateway.usdt(), heldBy: gatewayAddress };
 }

@@ -33,6 +33,11 @@ const prepareBody = (required: string[], extra: Record<string, object> = {}) => 
   },
 });
 const beneficiary = { ...address, description: "Who receives the XON on Xode. Defaults to `from`. On Xode it must equal `from`." };
+// Market-price purchases (AssetHub/Ethereum): give one of these to deposit with `depositForSwap`.
+const swapTerms = {
+  minXonOut: { type: "string", example: "3.8", description: "Pay at the Xode DEX's market price: the least XON accepted, else the USDT is refunded. AssetHub/Ethereum only." },
+  slippageBps: { type: "integer", minimum: 1, maximum: 5000, example: 100, description: "Pay at market price with the minimum set from a fresh DEX quote less this many basis points (100 = 1%). Needs the API's XODE_SUBSTRATE_RPC; ignored if minXonOut is given." },
+};
 
 export const openApiSpec = {
   openapi: "3.0.3",
@@ -76,10 +81,11 @@ export const openApiSpec = {
         operationId: "getQuote",
         tags: ["Info"],
         summary: "XON for a USDT amount",
-        description: "`warnings` say if the payout would be delayed or held for review. Refuses (422) amounts that round to 0 XON.",
+        description: "`warnings` say if the payout would be delayed or held for review. Refuses (422) amounts that round to 0 XON. `swap` is the market-price quote (AssetHub/Ethereum, when the API can quote the DEX), with the minimum `slippageBps` would set.",
         parameters: [
           { name: "amount", in: "query", required: true, schema: usdtInput },
           { name: "network", in: "query", required: false, schema: { ...networkName, default: "xode" } },
+          { name: "slippageBps", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 5000, default: 100 } },
         ],
         responses: { 200: json(ref("Quote")), ...errors(400, 404, 422, 502) },
       },
@@ -119,8 +125,8 @@ export const openApiSpec = {
         operationId: "prepareBuy",
         tags: ["Transactions"],
         summary: "Every transaction a purchase needs, in order",
-        description: "Xode: one USDT `transfer` into the vending contract. AssetHub/Ethereum: `approve` (only if the allowance is too low; on Ethereum a non-zero allowance is reset to 0 first) then `deposit`.",
-        requestBody: prepareBody(["network", "from", "amount"], { beneficiary }),
+        description: "Xode: one USDT `transfer` into the vending contract. AssetHub/Ethereum: `approve` (only if the allowance is too low; on Ethereum a non-zero allowance is reset to 0 first) then `deposit` - or `depositForSwap` with `minXonOut` / `slippageBps`, paid at the DEX's market price.",
+        requestBody: prepareBody(["network", "from", "amount"], { beneficiary, ...swapTerms }),
         responses: { 200: json(ref("PreparedPurchase")), ...errors(400, 404, 422, 502) },
       },
     },
@@ -139,8 +145,8 @@ export const openApiSpec = {
         operationId: "prepareDeposit",
         tags: ["Transactions"],
         summary: "Only the gateway deposit",
-        description: "Refuses (422) if the balance or allowance is too low. Not available on Xode - use buy.",
-        requestBody: prepareBody(["network", "from", "amount"], { beneficiary }),
+        description: "Refuses (422) if the balance or allowance is too low. Not available on Xode - use buy. With `minXonOut` / `slippageBps` it's a `depositForSwap`, paid at the DEX's market price.",
+        requestBody: prepareBody(["network", "from", "amount"], { beneficiary, ...swapTerms }),
         responses: { 200: json(ref("PreparedPurchase")), ...errors(400, 404, 422, 502) },
       },
     },
@@ -238,6 +244,11 @@ export const openApiSpec = {
           usdtDecimals: { type: "integer", example: 6 },
           networks: { type: "array", items: ref("NetworkInfo") },
           externalLimits: { type: "object", nullable: true, properties: { maxPerDeposit: ref("Amount"), maxPerDay: ref("Amount") } },
+          marketPrice: {
+            type: "object",
+            description: "Market-price purchases. `quotes` false means the API can't quote the DEX, so pass `minXonOut` rather than `slippageBps`.",
+            properties: { quotes: { type: "boolean" }, defaultSlippageBps: { type: "integer", example: 100 } },
+          },
         },
       },
       Limits: {
@@ -256,7 +267,18 @@ export const openApiSpec = {
       },
       Quote: {
         type: "object",
-        properties: { network: networkName, usdtAmount: ref("Amount"), xonAmount: ref("Amount"), warnings: { type: "array", items: { type: "string" } } },
+        properties: {
+          network: networkName,
+          usdtAmount: ref("Amount"),
+          xonAmount: { ...ref("Amount"), description: "At the vending contract's fixed rate." },
+          warnings: { type: "array", items: { type: "string" } },
+          swap: {
+            type: "object",
+            nullable: true,
+            description: "At the Xode DEX's market price (depositForSwap). Null on Xode, or when the API can't quote the DEX.",
+            properties: { xonAmount: ref("Amount"), minXonOut: ref("Amount"), slippageBps: { type: "integer" }, warnings: { type: "array", items: { type: "string" } } },
+          },
+        },
       },
       NetworkBalance: {
         type: "object",
@@ -291,7 +313,9 @@ export const openApiSpec = {
           from: address,
           usdtAmount: ref("Amount"),
           beneficiary: address,
-          xonAmount: ref("Amount"),
+          payout: { type: "string", enum: ["rate", "swap"], description: "Fixed rate (`deposit`/transfer) or market price (`depositForSwap`)." },
+          xonAmount: { ...nullable("Amount"), description: "Fixed rate: what's paid. Market price: the DEX's current quote (null if it can't be quoted)." },
+          minXonOut: { ...ref("Amount"), description: "Market price only: the least XON the deposit accepts." },
           warnings: { type: "array", items: { type: "string" } },
           steps: { type: "array", items: ref("TxStep") },
         },

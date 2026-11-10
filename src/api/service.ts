@@ -9,13 +9,17 @@ import { getSafeHead } from "../chain.js";
 import { USDT_DECIMALS, type Config } from "../config.js";
 import { readLedger, type LedgerRecord, type LedgerStatus } from "../ledger.js";
 import { depositIdAt, externalDepositId } from "../settlement.js";
-import { DEPOSITED_TOPIC, TRANSFER_TOPIC } from "../tools/common.js";
+import { GATEWAY_DEPOSIT_TOPICS, TRANSFER_TOPIC } from "../tools/common.js";
+import type { XodeDex } from "../xodeDex.js";
 import { ApiError } from "./http.js";
 import type { Network, NetworkName, Networks } from "./networks.js";
-import { approveSteps, depositStep, parseAddress, parseUsdt, purchaseSteps, type TxStep } from "./transactions.js";
+import { approveSteps, depositStep, parseAddress, parseSlippageBps, parseUsdt, parseXon, purchaseSteps, type TxStep } from "./transactions.js";
 
 export const SETTLED_TOPIC = ethers.id("Settled(address,bytes32,uint256,uint256)");
 export const EXTERNAL_SETTLED_TOPIC = ethers.id("ExternalSettled(address,string,bytes32,uint256,uint256)");
+export const EXTERNAL_SWAP_SETTLED_TOPIC = ethers.id("ExternalSwapSettled(address,string,bytes32,uint256,uint256)");
+/// Slippage tolerance for market-price quotes when the caller doesn't give `slippageBps` (100 = 1%).
+export const DEFAULT_SLIPPAGE_BPS = 100n;
 const XON_DECIMALS = 18;
 
 export interface Amount {
@@ -75,7 +79,7 @@ export function receiptJson(receipt: TransactionReceipt) {
 
 /// The purchase deposits in a deposit tx's logs, in the order the relayer numbers them (log
 /// order - see depositScanner.ts): USDT transfers into the vending contract on Xode, gateway
-/// `Deposited` events elsewhere.
+/// `Deposited` / `SwapDeposited` events elsewhere.
 export function depositsInLogs(network: Pick<Network, "name" | "usdtAddress" | "payTo" | "gateway">, txHash: string, logs: readonly Log[]) {
   const ordered = [...logs].sort((a, b) => a.index - b.index);
   const payTo = network.payTo.toLowerCase();
@@ -86,7 +90,7 @@ export function depositsInLogs(network: Pick<Network, "name" | "usdtAddress" | "
       if (ethers.getAddress(ethers.dataSlice(log.topics[2], 12)).toLowerCase() !== payTo) continue;
       found.push({ beneficiary: ethers.getAddress(ethers.dataSlice(log.topics[1], 12)), usdtAmount: ethers.toBigInt(log.data) });
     } else {
-      if (log.address.toLowerCase() !== payTo || log.topics[0] !== DEPOSITED_TOPIC) continue;
+      if (log.address.toLowerCase() !== payTo || !GATEWAY_DEPOSIT_TOPICS.includes(log.topics[0])) continue;
       const parsed = network.gateway.interface.parseLog(log);
       if (parsed) found.push({ beneficiary: parsed.args.xodeBeneficiary, usdtAmount: parsed.args.usdtAmount });
     }
@@ -148,7 +152,9 @@ const LEDGER_STATES: Partial<Record<LedgerStatus, DepositState>> = {
 
 export type ApiService = ReturnType<typeof makeApiService>;
 
-export function makeApiService(config: Config, networks: Networks) {
+/// `dex` (Xode's DEX over Substrate RPC) enables market-price quotes; without it, only explicit
+/// `minXonOut` market-price purchases can be prepared.
+export function makeApiService(config: Config, networks: Networks, dex: XodeDex | null = null) {
   const { xode, vending } = networks;
   const ledger = makeLedgerView(config.ledgerFile);
 
@@ -178,7 +184,15 @@ export function makeApiService(config: Config, networks: Networks) {
     if (xon === 0n) throw new ApiError(422, "AmountTooSmall", "That amount rounds down to 0 XON - it would never be paid out. Send more USDT.");
     const warnings: string[] = [];
     if (reserve < xon) warnings.push("The vending contract's XON reserve is currently below this payout - it will be paid once the reserve is topped up.");
+    warnings.push(...await limitWarnings(net, amount, limits));
+    return { xon, warnings };
+  }
+
+  /// Whether the external payout limits will delay or hold a deposit of `amount`.
+  async function limitWarnings(net: Network, amount: bigint, known?: Awaited<ReturnType<typeof externalLimits>>): Promise<string[]> {
+    const warnings: string[] = [];
     if (net.gateway) {
+      const limits = known === undefined ? await externalLimits() : known;
       const relayerCap = config.payoutLimits.maxPerDeposit;
       if (limits && (limits.maxPerDeposit === 0n || limits.maxPerDay === 0n)) {
         warnings.push(`Payouts for ${net.name} deposits are currently switched off - the deposit will be held until an operator enables them.`);
@@ -188,7 +202,51 @@ export function makeApiService(config: Config, networks: Networks) {
         warnings.push("Today's payout allowance is nearly used up - XON for this deposit may be delayed until it refills.");
       }
     }
-    return { xon, warnings };
+    return warnings;
+  }
+
+  /// How a gateway purchase is paid, from the request: at market price if it names `minXonOut`
+  /// (an XON amount) or `slippageBps` (minimum = a fresh DEX quote less that much), else at the
+  /// vending contract's fixed rate.
+  async function payoutTerms(net: Network, amount: bigint, input: { minXonOut?: unknown; slippageBps?: unknown }): Promise<{ minXonOut: bigint; quote: bigint | null } | null> {
+    if (input.minXonOut === undefined && input.slippageBps === undefined) return null;
+    if (!net.gateway) throw new ApiError(400, "SwapNotSupported", "Market-price purchases are for AssetHub/Ethereum deposits - on Xode, swap on the DEX directly.");
+    const quote = dex ? await dex.quoteUsdtToXon(amount) : null;
+    if (input.minXonOut !== undefined) return { minXonOut: parseXon(input.minXonOut, "minXonOut"), quote };
+    const bps = parseSlippageBps(input.slippageBps);
+    if (!dex) throw new ApiError(503, "SwapQuotesUnavailable", "This API can't quote the DEX (no XODE_SUBSTRATE_RPC) - pass minXonOut instead of slippageBps.");
+    if (quote === null) throw new ApiError(422, "NoPoolLiquidity", "The Xode DEX can't quote XON for USDT right now.");
+    return { minXonOut: (quote * (10_000n - bps)) / 10_000n, quote };
+  }
+
+  /// Warnings for a market-price purchase, like purchaseChecks' for a fixed-rate one.
+  async function swapChecks(net: Network, amount: bigint, minXonOut: bigint, quote: bigint | null): Promise<string[]> {
+    let inventory: bigint;
+    try {
+      inventory = await vending.accountedUsdt();
+    } catch {
+      throw new ApiError(422, "SwapNotSupported", "The vending contract predates market-price payouts - use a fixed-rate purchase (leave out minXonOut / slippageBps).");
+    }
+    const warnings = await limitWarnings(net, amount);
+    if (quote !== null && quote < minXonOut) warnings.push("The DEX currently gives less XON than this minimum - unless the price moves back, the deposit will be refunded rather than paid.");
+    if (inventory < amount) warnings.push("The vending contract's USDT inventory for market-price payouts is below this amount - XON will be paid once it's topped up.");
+    return warnings;
+  }
+
+  /// What a prepared purchase will pay: `payout` "rate" (fixed) or "swap" (market price, with the
+  /// minimum and the DEX's current quote), and warnings for either.
+  async function payoutSummary(net: Network, amount: bigint, terms: Awaited<ReturnType<typeof payoutTerms>>) {
+    if (!terms) {
+      const { xon, warnings } = await purchaseChecks(net, amount);
+      return { payout: "rate", xonAmount: nativeAmount(xon), warnings };
+    }
+    const warnings = await swapChecks(net, amount, terms.minXonOut, terms.quote);
+    return {
+      payout: "swap",
+      xonAmount: terms.quote === null ? null : nativeAmount(terms.quote),
+      minXonOut: nativeAmount(terms.minXonOut),
+      warnings,
+    };
   }
 
   async function requireUsdtBalance(net: Network, from: string, amount: bigint): Promise<void> {
@@ -228,6 +286,9 @@ export function makeApiService(config: Config, networks: Networks) {
           confirmations: net.confirmations,
         })),
         externalLimits: limits && { maxPerDeposit: usdtAmount(limits.maxPerDeposit), maxPerDay: usdtAmount(limits.maxPerDay) },
+        // Market-price purchases (gateway depositForSwap): `quotes` says whether /api/quote and
+        // `slippageBps` work here, or the caller has to supply `minXonOut` itself.
+        marketPrice: { quotes: dex !== null, defaultSlippageBps: Number(DEFAULT_SLIPPAGE_BPS) },
       };
     },
 
@@ -245,11 +306,27 @@ export function makeApiService(config: Config, networks: Networks) {
       };
     },
 
-    async quote(amountValue: unknown, networkName: string | null) {
+    /// The fixed-rate quote, plus - on AssetHub/Ethereum, when the DEX can be quoted - the
+    /// market-price one with the minimum `slippageBps` (default 1%) would set.
+    async quote(amountValue: unknown, networkName: string | null, slippageValue: string | null = null) {
       const amount = parseUsdt(amountValue);
       const net = network(networkName ?? "xode");
       const { xon, warnings } = await purchaseChecks(net, amount);
-      return { network: net.name, usdtAmount: usdtAmount(amount), xonAmount: nativeAmount(xon), warnings };
+      let swap = null;
+      if (net.gateway && dex) {
+        const slippageBps = slippageValue === null ? DEFAULT_SLIPPAGE_BPS : parseSlippageBps(slippageValue);
+        const quoted = await dex.quoteUsdtToXon(amount);
+        if (quoted !== null) {
+          const minXonOut = (quoted * (10_000n - slippageBps)) / 10_000n;
+          try {
+            swap = { xonAmount: nativeAmount(quoted), minXonOut: nativeAmount(minXonOut), slippageBps: Number(slippageBps), warnings: await swapChecks(net, amount, minXonOut, quoted) };
+          } catch (err) {
+            // A vending contract without market-price payouts: quote the fixed rate only.
+            if (!(err instanceof ApiError && err.code === "SwapNotSupported")) throw err;
+          }
+        }
+      }
+      return { network: net.name, usdtAmount: usdtAmount(amount), xonAmount: nativeAmount(xon), warnings, swap };
     },
 
     async balances(addressValue: string, networkNames: string[] | null) {
@@ -294,13 +371,13 @@ export function makeApiService(config: Config, networks: Networks) {
       const from = parseAddress(body.from, "from");
       const beneficiary = body.beneficiary === undefined ? from : parseAddress(body.beneficiary, "beneficiary");
       const amount = parseUsdt(body.amount);
-      const step = depositStep(net, from, amount, beneficiary);
+      const terms = await payoutTerms(net, amount, body);
+      const step = depositStep(net, from, amount, beneficiary, terms?.minXonOut);
       const [allowance] = await Promise.all([allowanceOf(net, from), requireUsdtBalance(net, from, amount)]);
       if (allowance < amount) {
         throw new ApiError(422, "InsufficientAllowance", `The gateway may take ${ethers.formatUnits(allowance, USDT_DECIMALS)} USDT from ${from} - approve at least ${ethers.formatUnits(amount, USDT_DECIMALS)} first (POST /api/tx/approve).`);
       }
-      const { xon, warnings } = await purchaseChecks(net, amount);
-      return prepared(net, from, amount, [step], { beneficiary, xonAmount: nativeAmount(xon), warnings });
+      return prepared(net, from, amount, [step], { beneficiary, ...await payoutSummary(net, amount, terms) });
     },
 
     /// The whole purchase: every transaction needed, in order.
@@ -309,10 +386,10 @@ export function makeApiService(config: Config, networks: Networks) {
       const from = parseAddress(body.from, "from");
       const beneficiary = body.beneficiary === undefined ? from : parseAddress(body.beneficiary, "beneficiary");
       const amount = parseUsdt(body.amount);
+      const terms = await payoutTerms(net, amount, body);
       const [allowance] = await Promise.all([allowanceOf(net, from), requireUsdtBalance(net, from, amount)]);
-      const steps = purchaseSteps(net, from, amount, beneficiary, allowance);
-      const { xon, warnings } = await purchaseChecks(net, amount);
-      return prepared(net, from, amount, steps, { beneficiary, xonAmount: nativeAmount(xon), warnings });
+      const steps = purchaseSteps(net, from, amount, beneficiary, allowance, terms?.minXonOut);
+      return prepared(net, from, amount, steps, { beneficiary, ...await payoutSummary(net, amount, terms) });
     },
 
     /// Relays a transaction the buyer's wallet signed but didn't send itself - only to this
@@ -389,8 +466,10 @@ export function makeApiService(config: Config, networks: Networks) {
     async findPayout(depositId: string, external: boolean, fromBlock: number): Promise<{ settleTxHash: string; xonAmount: Amount } | null> {
       const head = await xode.provider.getBlockNumber();
       const start = Math.max(fromBlock, head - config.logChunkSize + 1, 0);
-      // Xode's bridge rejects null topic wildcards, so filter on topic0 and match the id here.
-      const logs = await xode.provider.getLogs({ address: xode.payTo, topics: [external ? EXTERNAL_SETTLED_TOPIC : SETTLED_TOPIC], fromBlock: start, toBlock: head });
+      // Xode's bridge rejects null topic wildcards, so filter on topic0 and match the id here. An
+      // external deposit is paid by either kind of payout, fixed-rate or market-price.
+      const topic0 = external ? [EXTERNAL_SETTLED_TOPIC, EXTERNAL_SWAP_SETTLED_TOPIC] : SETTLED_TOPIC;
+      const logs = await xode.provider.getLogs({ address: xode.payTo, topics: [topic0], fromBlock: start, toBlock: head });
       for (const log of logs) {
         if (log.topics[2]?.toLowerCase() !== depositId.toLowerCase()) continue;
         const parsed = vending.interface.parseLog(log);

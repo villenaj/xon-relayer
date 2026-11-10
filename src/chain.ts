@@ -73,7 +73,8 @@ export async function getSafeHead(provider: JsonRpcProvider, confirmations: Conf
 export interface LogScan {
   provider: JsonRpcProvider;
   address: string;
-  topic: string;
+  /// Event topic0 to fetch; an array fetches logs with any of them.
+  topic: string | string[];
   chunkSize: number;
 }
 
@@ -95,6 +96,7 @@ export async function scanLogs(
   let start = fromBlock;
   while (start <= toBlock && !shouldStop()) {
     const end = Math.min(start + chunkSize - 1, toBlock);
+    // An array of topics matches a log with any of them.
     const logs = await provider.getLogs({ address, topics: [topic], fromBlock: start, toBlock: end });
     const stalledAtBlock = await handle(logs);
     start = stalledAtBlock ?? end + 1;

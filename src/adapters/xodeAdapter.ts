@@ -3,6 +3,7 @@
 // `settlePurchase` in XonVendingMachine.sol).
 
 import { ethers } from "ethers";
+import { isAccountedByVending } from "./accountedTransfers.js";
 import { runDepositScanner } from "./depositScanner.js";
 import type { AdapterContext } from "./types.js";
 
@@ -42,7 +43,9 @@ export async function runXodeAdapter(context: AdapterContext): Promise<void> {
     },
     // Native deposits are identified on-chain by their own tx hash (indexed past the first).
     baseDepositId: (txHash) => txHash,
-    isSettled: (d) => settlement.isNativeSettled(d.depositId),
+    // USDT the contract pulled in and accounted for itself (buy(), fundUsdtInventory()) isn't a
+    // deposit: there's nothing to pay, and settlePurchase would revert UnverifiedDeposit forever.
+    isSettled: async (d) => (await settlement.isNativeSettled(d.depositId)) || isAccountedByVending(provider, vendingAddress, d.sourceTxHash),
     settle: (d) => settlement.settleNative(d.buyer, d.usdtAmount, d.depositId, LABEL),
   });
 }
