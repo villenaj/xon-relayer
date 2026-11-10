@@ -184,6 +184,38 @@ export function makeApiService(config: Config, networks: Networks, dex: XodeDex 
 
   /// Things the buyer should know before paying: whether the payout will be instant, delayed or
   /// held for review. Refuses outright only when the deposit could never be paid at all.
+  /// The gateway's minimum deposit and refund fee (both 0 on gateways that predate them).
+  async function gatewayRules(net: Network): Promise<{ minDeposit: bigint; refundFee: bigint }> {
+    if (!net.gateway) return { minDeposit: 0n, refundFee: 0n };
+    try {
+      const [minDeposit, refundFee]: bigint[] = await Promise.all([net.gateway.minDeposit(), net.gateway.refundFee()]);
+      return { minDeposit, refundFee };
+    } catch {
+      return { minDeposit: 0n, refundFee: 0n };
+    }
+  }
+
+  /// A deposit under the gateway's minimum would just revert - refuse it up front.
+  async function requireMinDeposit(net: Network, amount: bigint): Promise<{ minDeposit: bigint; refundFee: bigint }> {
+    const rules = await gatewayRules(net);
+    if (amount < rules.minDeposit) {
+      throw new ApiError(422, "BelowMinimumDeposit", `The ${net.name} gateway takes deposits of at least ${ethers.formatUnits(rules.minDeposit, USDT_DECIMALS)} USDT.`);
+    }
+    return rules;
+  }
+
+  /// The beneficiary's own daily limit (shared by every path); null when there's none.
+  async function addressWarning(beneficiary: string | undefined, amount: bigint): Promise<string | null> {
+    if (!beneficiary) return null;
+    try {
+      const available: bigint = await vending.addressAvailable(beneficiary);
+      if (amount > available) return `This is over what ${beneficiary} can still receive today (${ethers.formatUnits(available, USDT_DECIMALS)} USDT's worth) - the deposit would be held until an operator reviews it.`;
+    } catch {
+      // A vending contract without per-address limits.
+    }
+    return null;
+  }
+
   async function purchaseChecks(net: Network, amount: bigint): Promise<{ xon: bigint; warnings: string[] }> {
     const [xon, reserve, limits]: [bigint, bigint, Awaited<ReturnType<typeof externalLimits>>] = await Promise.all([
       vending.quote(amount),
@@ -191,7 +223,17 @@ export function makeApiService(config: Config, networks: Networks, dex: XodeDex 
       net.gateway ? externalLimits() : Promise.resolve(null),
     ]);
     if (xon === 0n) throw new ApiError(422, "AmountTooSmall", "That amount rounds down to 0 XON - it would never be paid out. Send more USDT.");
+    await requireMinDeposit(net, amount);
     const warnings: string[] = [];
+    let fixedPaused = false;
+    try {
+      fixedPaused = await vending.fixedRatePaused();
+    } catch {
+      // A vending contract without the fixed-rate pause.
+    }
+    if (fixedPaused) {
+      warnings.push(`Fixed-rate payouts are paused right now (the fixed rate is too far from the DEX price) - this would be held until an operator reviews it.${net.gateway ? " Pay at market price instead (slippageBps / minXonOut)." : ""}`);
+    }
     if (reserve < xon) warnings.push("The vending contract's XON reserve is currently below this payout - it will be paid once the reserve is topped up.");
     warnings.push(...await limitWarnings(net, amount, limits));
     return { xon, warnings };
@@ -246,25 +288,31 @@ export function makeApiService(config: Config, networks: Networks, dex: XodeDex 
     } catch {
       throw new ApiError(422, "SwapNotSupported", "The vending contract predates market-price payouts - use a fixed-rate purchase (leave out minXonOut / slippageBps).");
     }
+    const { refundFee } = await requireMinDeposit(net, amount);
     const warnings = await limitWarnings(net, amount);
-    if (quote !== null && quote < minXonOut) warnings.push("The DEX currently gives less XON than this minimum - unless the price moves back, the deposit will be refunded rather than paid.");
+    const fee = refundFee > 0n ? `, less a ${ethers.formatUnits(refundFee < amount ? refundFee : amount, USDT_DECIMALS)} USDT refund fee` : "";
+    if (quote !== null && quote < minXonOut) warnings.push(`The DEX currently gives less XON than this minimum - unless the price moves back, the deposit will be refunded${fee} rather than paid.`);
     if (inventory < amount) warnings.push("The vending contract's USDT inventory for market-price payouts is below this amount - XON will be paid once it's topped up.");
     return warnings;
   }
 
   /// What a prepared purchase will pay: `payout` "rate" (fixed) or "swap" (market price, with the
   /// minimum and the DEX's current quote), and warnings for either.
-  async function payoutSummary(net: Network, amount: bigint, terms: Awaited<ReturnType<typeof payoutTerms>>) {
+  async function payoutSummary(net: Network, amount: bigint, terms: Awaited<ReturnType<typeof payoutTerms>>, beneficiary?: string) {
+    const perAddress = await addressWarning(beneficiary, amount);
     if (!terms) {
       const { xon, warnings } = await purchaseChecks(net, amount);
-      return { payout: "rate", xonAmount: nativeAmount(xon), warnings };
+      return { payout: "rate", xonAmount: nativeAmount(xon), warnings: perAddress ? [...warnings, perAddress] : warnings };
     }
     const warnings = await swapChecks(net, amount, terms.minXonOut, terms.quote);
+    const { refundFee } = await gatewayRules(net);
     return {
       payout: "swap",
       xonAmount: terms.quote === null ? null : nativeAmount(terms.quote),
       minXonOut: nativeAmount(terms.minXonOut),
-      warnings,
+      // Kept from a refund only if the minimum can't be met (raw USDT units).
+      refundFee: usdtAmount(refundFee),
+      warnings: perAddress ? [...warnings, perAddress] : warnings,
     };
   }
 
@@ -304,6 +352,12 @@ export function makeApiService(config: Config, networks: Networks, dex: XodeDex 
           flow: net.gateway ? "approve-deposit" : "transfer",
           confirmations: net.confirmations,
         })),
+        // Per gateway: the smallest deposit accepted, and the fee kept from a market-price refund
+        // whose own minimum couldn't be met.
+        gateways: Object.fromEntries(await Promise.all([...networks.byName.values()].filter((n) => n.gateway).map(async (n) => {
+          const r = await gatewayRules(n);
+          return [n.name, { minDeposit: usdtAmount(r.minDeposit), refundFee: usdtAmount(r.refundFee) }];
+        }))),
         externalLimits: limits && { maxPerDeposit: usdtAmount(limits.maxPerDeposit), maxPerDay: usdtAmount(limits.maxPerDay) },
         // Market-price purchases (gateway depositForSwap): `quotes` says whether /api/quote and
         // `slippageBps` work here, or the caller has to supply `minXonOut` itself.
@@ -338,7 +392,8 @@ export function makeApiService(config: Config, networks: Networks, dex: XodeDex 
         if (quoted !== null) {
           const minXonOut = (quoted * (10_000n - slippageBps)) / 10_000n;
           try {
-            swap = { xonAmount: nativeAmount(quoted), minXonOut: nativeAmount(minXonOut), slippageBps: Number(slippageBps), warnings: await swapChecks(net, amount, minXonOut, quoted) };
+            const checks = await swapChecks(net, amount, minXonOut, quoted);
+            swap = { xonAmount: nativeAmount(quoted), minXonOut: nativeAmount(minXonOut), slippageBps: Number(slippageBps), refundFee: usdtAmount((await gatewayRules(net)).refundFee), warnings: checks };
           } catch (err) {
             // A vending contract without market-price payouts: quote the fixed rate only.
             if (!(err instanceof ApiError && err.code === "SwapNotSupported")) throw err;
@@ -396,7 +451,7 @@ export function makeApiService(config: Config, networks: Networks, dex: XodeDex 
       if (allowance < amount) {
         throw new ApiError(422, "InsufficientAllowance", `The gateway may take ${ethers.formatUnits(allowance, USDT_DECIMALS)} USDT from ${from} - approve at least ${ethers.formatUnits(amount, USDT_DECIMALS)} first (POST /api/tx/approve).`);
       }
-      return prepared(net, from, amount, [step], { beneficiary, ...await payoutSummary(net, amount, terms) });
+      return prepared(net, from, amount, [step], { beneficiary, ...await payoutSummary(net, amount, terms, beneficiary) });
     },
 
     /// The whole purchase: every transaction needed, in order.
@@ -408,7 +463,7 @@ export function makeApiService(config: Config, networks: Networks, dex: XodeDex 
       const terms = await payoutTerms(net, amount, body);
       const [allowance] = await Promise.all([allowanceOf(net, from), requireUsdtBalance(net, from, amount)]);
       const steps = purchaseSteps(net, from, amount, beneficiary, allowance, terms?.minXonOut);
-      return prepared(net, from, amount, steps, { beneficiary, ...await payoutSummary(net, amount, terms) });
+      return prepared(net, from, amount, steps, { beneficiary, ...await payoutSummary(net, amount, terms, beneficiary) });
     },
 
     /// Relays a transaction the buyer's wallet signed but didn't send itself - only to this

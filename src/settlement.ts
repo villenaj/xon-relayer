@@ -136,11 +136,29 @@ export interface SettlementClientOptions {
   rpcTimeoutMs: number;
   /// Development only: let the relayer key also be the vending contract's owner.
   allowOwnerAsRelayer?: boolean;
+  /// Whether this instance settles Xode-native deposits (needs the contract's `relayer` key) and
+  /// cross-chain ones (needs an attester key). Both by default.
+  roles?: { native: boolean; external: boolean };
+  /// Up to this many ms of random wait before executing a market-price swap, so its moment is
+  /// harder to predict and sandwich. 0 = none.
+  settleJitterMs?: number;
+}
+
+/// Not an error as such: this relayer has voted for the deposit, but too few other attesters have
+/// yet. The adapter retries (and so waits for them) like any transient failure.
+export class AwaitingQuorumError extends Error {
+  constructor(readonly depositId: string, readonly votes: bigint, readonly threshold: bigint) {
+    super(`Voted for ${depositId}; waiting for other attesters (${votes} of ${threshold} votes).`);
+    this.name = "AwaitingQuorumError";
+  }
 }
 
 export type SettlementClient = Awaited<ReturnType<typeof createSettlementClient>>;
 
-export async function createSettlementClient({ xodeEthRpc, vendingAddress, relayerPrivateKey, expectedChainId, rpcTimeoutMs, allowOwnerAsRelayer = false }: SettlementClientOptions) {
+export async function createSettlementClient({
+  xodeEthRpc, vendingAddress, relayerPrivateKey, expectedChainId, rpcTimeoutMs, allowOwnerAsRelayer = false,
+  roles = { native: true, external: true }, settleJitterMs = 0,
+}: SettlementClientOptions) {
   const provider = makeProvider(xodeEthRpc, rpcTimeoutMs);
   const chainId = await verifyEndpoint(provider, { label: "xode", expectedChainId, contracts: { XonVendingMachine: vendingAddress } });
   const wallet = new ethers.Wallet(relayerPrivateKey, provider);
@@ -153,12 +171,41 @@ export async function createSettlementClient({ xodeEthRpc, vendingAddress, relay
   const vending = new ethers.Contract(vendingAddress, VENDING_ABI, signer);
   const sender: Sender = { provider, wallet, signer };
 
-  const onChainRelayer: string = await vending.relayer();
-  if (onChainRelayer.toLowerCase() !== wallet.address.toLowerCase()) {
+  if (roles.native) {
+    const onChainRelayer: string = await vending.relayer();
+    if (onChainRelayer.toLowerCase() !== wallet.address.toLowerCase()) {
+      throw new Error(
+        `The relayer key (${wallet.address}) does not match XonVendingMachine's relayer (${onChainRelayer}), which Xode-native deposits need. ` +
+        `Use the right key, or run this instance with ENABLE_XODE_ADAPTER=false (only one relayer settles those).`,
+      );
+    }
+  }
+  if (roles.external && !(await vending.isAttester(wallet.address))) {
     throw new Error(
-      `The relayer key (${wallet.address}) does not match XonVendingMachine's relayer (${onChainRelayer}). ` +
-      `Call setRelayer on the contract first, or use the right key.`,
+      `The relayer key (${wallet.address}) isn't one of XonVendingMachine's attesters, whose votes cross-chain payouts need. ` +
+      `Have the owner add it (addAttester - a queued change), or use an attester's key.`,
     );
+  }
+
+  /// Votes for a cross-chain deposit (once), then executes it if enough attesters agree - otherwise
+  /// throws AwaitingQuorumError, and the adapter comes back to it.
+  async function attestThenExecute(
+    label: string, depositId: string, params: string,
+    attest: () => Promise<TransactionResponse>, execute: () => Promise<TransactionResponse>, jitter: boolean,
+  ): Promise<TransactionReceipt> {
+    if (!(await vending.hasAttested(depositId, wallet.address))) {
+      const vote = await sendAndConfirm(sender, label, attest);
+      console.log(`[${label}] Voted for ${depositId} (tx ${vote.hash}).`);
+    }
+    const [votes, threshold]: bigint[] = await Promise.all([vending.attestations(depositId, params), vending.attestationThreshold()]);
+    if (votes < threshold) throw new AwaitingQuorumError(depositId, votes, threshold);
+    if (jitter && settleJitterMs > 0) {
+      const wait = Math.floor(Math.random() * settleJitterMs);
+      await new Promise((resolve) => setTimeout(resolve, wait));
+      // Another attester may have executed it meanwhile.
+      if (await vending.externalSettledDeposits(depositId)) throw Object.assign(new Error("Executed by another attester."), { data: vending.interface.encodeErrorResult("AlreadyExternallySettled", []) });
+    }
+    return sendAndConfirm(sender, label, execute);
   }
   // The relayer key lives on a server and signs unattended; the owner key can withdraw the whole
   // XON reserve and USDT inventory, lift every limit and replace the relayer. One key for both
@@ -206,7 +253,10 @@ export async function createSettlementClient({ xodeEthRpc, vendingAddress, relay
     },
     async settleExternal(buyer: string, usdtAmount: bigint, sourceChain: string, depositId: string, label: string): Promise<TransactionReceipt> {
       console.log(`[${label}] New deposit: ${buyer} paid ${usdtAmount.toString()} USDT on ${sourceChain} (id ${depositId}). Settling...`);
-      const receipt = await sendAndConfirm(sender, label, () => vending.settleExternalPurchase(buyer, usdtAmount, sourceChain, depositId));
+      const params: string = await vending.purchaseParams(buyer, usdtAmount, sourceChain);
+      const receipt = await attestThenExecute(label, depositId, params,
+        () => vending.attestExternalPurchase(buyer, usdtAmount, sourceChain, depositId),
+        () => vending.settleExternalPurchase(buyer, usdtAmount, sourceChain, depositId), false);
       console.log(`[${label}] Settled ${depositId} in block ${receipt.blockNumber} (settle tx ${receipt.hash}).`);
       return receipt;
     },
@@ -214,7 +264,10 @@ export async function createSettlementClient({ xodeEthRpc, vendingAddress, relay
     /// for XON on Xode's DEX and pays the buyer the result, if it's at least `minXonOut`.
     async settleExternalSwap(buyer: string, usdtAmount: bigint, minXonOut: bigint, sourceChain: string, depositId: string, label: string): Promise<TransactionReceipt> {
       console.log(`[${label}] New swap deposit: ${buyer} paid ${usdtAmount.toString()} USDT on ${sourceChain}, minimum ${ethers.formatEther(minXonOut)} XON (id ${depositId}). Settling...`);
-      const receipt = await sendAndConfirm(sender, label, () => vending.settleExternalSwap(buyer, usdtAmount, minXonOut, sourceChain, depositId));
+      const params: string = await vending.swapParams(buyer, usdtAmount, minXonOut, sourceChain);
+      const receipt = await attestThenExecute(label, depositId, params,
+        () => vending.attestExternalSwap(buyer, usdtAmount, minXonOut, sourceChain, depositId),
+        () => vending.settleExternalSwap(buyer, usdtAmount, minXonOut, sourceChain, depositId), true);
       console.log(`[${label}] Settled ${depositId} at market price in block ${receipt.blockNumber} (settle tx ${receipt.hash}).`);
       return receipt;
     },

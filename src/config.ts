@@ -172,6 +172,11 @@ export const config = {
   rateKeeperIntervalMs: Number(process.env.RATE_KEEPER_INTERVAL_MS ?? 60_000),
   rateDeadbandBps: bps("RATE_DEADBAND_BPS", 50),
   rateAlertBps: bps("RATE_ALERT_BPS", 300),
+  // Past this, the keeper pauses the fixed-rate paths until the rate is back within half of it
+  // (0 = never). Defaults to RATE_ALERT_BPS.
+  ratePauseBps: bps("RATE_PAUSE_BPS", Number(process.env.RATE_ALERT_BPS ?? 300)),
+  // Up to this many ms of random wait before a market-price swap executes (see settlement.ts).
+  settleJitterMs: Number(process.env.SETTLE_JITTER_MS ?? 15_000),
   // Optional chat webhook (Slack/Discord/Mattermost-style) that alerts are POSTed to.
   alertWebhookUrl: process.env.ALERT_WEBHOOK_URL || null,
 

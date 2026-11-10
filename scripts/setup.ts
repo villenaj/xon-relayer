@@ -10,6 +10,13 @@
 //     relayer refuses to run with the owner key (ALLOW_OWNER_AS_RELAYER=true overrides, dev only).
 //   - RATE_KEEPER_PRIVATE_KEY: the key allowed to nudge the fixed rate toward the DEX price within
 //     the bounds below - generated if unset; RATE_KEEPER=false skips appointing one.
+//   - ATTESTERS: how many independent relayers vote on cross-chain payouts (default 1: just the
+//     relayer). Each extra one gets a generated key (ATTESTER_2_PRIVATE_KEY, ...) - run a relayer
+//     instance per key, ideally on different machines and RPCs - and ATTESTATION_THRESHOLD of them
+//     must agree (default: a majority).
+//
+// All of this is configured while the deployer still owns the contracts; once they're handed over
+// (transferOwnership), raising limits, adding attesters and similar changes wait 48h in the queue.
 //
 // Safe to re-run: the asset is only created if missing, balances are topped up to their targets
 // rather than sent again, and contracts named in VENDING_ADDRESS / ASSETHUB_GATEWAY_ADDRESS /
@@ -63,6 +70,13 @@ const MAX_PER_DAY = usdt(env("EXTERNAL_MAX_PER_DAY_USDT", "1000"));
 // Limits on the Xode-native purchase paths (buy / settlePurchase), which start closed on-chain.
 const NATIVE_MAX_PER_PURCHASE = usdt(env("NATIVE_MAX_PER_PURCHASE_USDT", "100"));
 const NATIVE_MAX_PER_DAY = usdt(env("NATIVE_MAX_PER_DAY_USDT", "1000"));
+// What one buyer / beneficiary can take per day across every path (0 = no per-address limit).
+const ADDRESS_MAX_PER_DAY = usdt(env("ADDRESS_MAX_PER_DAY_USDT", "0"));
+const ATTESTERS = Number(env("ATTESTERS", "1"));
+const ATTESTATION_THRESHOLD = BigInt(env("ATTESTATION_THRESHOLD", String(Math.floor(ATTESTERS / 2) + 1)));
+// Gateways: smallest deposit, and the fee kept from a market-price refund whose own minimum failed.
+const MIN_DEPOSIT = usdt(env("MIN_DEPOSIT_USDT", "1"));
+const REFUND_FEE = usdt(env("REFUND_FEE_USDT", "0.5"));
 const RATE_KEEPER = flag("RATE_KEEPER", true);
 // Custody roles per chain (see contracts' Custodial.sol): where withdrawals go, and who can pause
 // and veto treasury changes. Each defaults to the contract owner - fine for development; in
@@ -195,6 +209,18 @@ async function requireOwner(name: string, contract: ethers.Contract, owner: stri
   if (onChain !== owner) throw new Error(`[${name}] ${await contract.getAddress()} is owned by ${onChain}, not the contract owner ${owner}.`);
 }
 
+/// The gateway's minimum deposit and refund fee, while the deployer still owns it.
+async function gatewayRules(name: string, gateway: ethers.Contract): Promise<void> {
+  if ((await gateway.minDeposit()) !== MIN_DEPOSIT) {
+    await (await gateway.setMinDeposit(MIN_DEPOSIT)).wait();
+    console.log(`[${name}] minimum deposit ${ethers.formatUnits(MIN_DEPOSIT, 6)} USDT`);
+  }
+  if ((await gateway.refundFee()) !== REFUND_FEE) {
+    await (await gateway.setRefundFee(REFUND_FEE)).wait();
+    console.log(`[${name}] refund fee ${ethers.formatUnits(REFUND_FEE, 6)} USDT (only when a deposit's own minimum isn't met)`);
+  }
+}
+
 async function main(): Promise<void> {
   await cryptoWaitReady();
   const assetOwner = new Keyring({ type: "sr25519", ss58Format: 42 }).addFromUri(env("ASSET_OWNER_SURI", "//Alice"));
@@ -208,6 +234,11 @@ async function main(): Promise<void> {
   const relayerIsOwner = relayer.address === owner.address;
   const keeperKey = RATE_KEEPER ? (process.env.RATE_KEEPER_PRIVATE_KEY || ethers.Wallet.createRandom().privateKey) : null;
   const keeper = keeperKey ? new ethers.Wallet(keeperKey) : null;
+  if (!Number.isInteger(ATTESTERS) || ATTESTERS < 1 || ATTESTATION_THRESHOLD < 1n || ATTESTATION_THRESHOLD > BigInt(ATTESTERS)) {
+    throw new Error(`ATTESTERS must be 1 or more, and ATTESTATION_THRESHOLD between 1 and ATTESTERS (got ${ATTESTERS} / ${ATTESTATION_THRESHOLD}).`);
+  }
+  const extraAttesterKeys = Array.from({ length: ATTESTERS - 1 }, (_, i) => process.env[`ATTESTER_${i + 2}_PRIVATE_KEY`] || ethers.Wallet.createRandom().privateKey);
+  const extraAttesters = extraAttesterKeys.map((k) => new ethers.Wallet(k));
 
   console.log("asset owner (Xode + AssetHub):", assetOwner.address);
   console.log("contract owner:", owner.address, generatedOwner ? "(generated - saved to the output file)" : "");
@@ -227,6 +258,7 @@ async function main(): Promise<void> {
     const xodeFunding: SubstrateFunding[] = [{ evmAddress: owner.address, target: VENDING_RESERVE_XON + gas }];
     if (!relayerIsOwner) xodeFunding.push({ evmAddress: relayer.address, target: gas });
     if (keeper) xodeFunding.push({ evmAddress: keeper.address, target: gas });
+    for (const a of extraAttesters) xodeFunding.push({ evmAddress: a.address, target: gas });
     xodeFunding.push(...buyerFunding);
     await setUpSubstrateChain("xode", xode, assetOwner, usdtRecipients, xodeFunding);
   } finally {
@@ -263,6 +295,21 @@ async function main(): Promise<void> {
     console.log(`[xode] rate keeper ${keeper.address}: up to ${Number(RATE_KEEPER_MAX_STEP_BPS) / 100}% per update, every ${RATE_KEEPER_MIN_INTERVAL}s at most`);
   }
   if (keeperKey) out.RATE_KEEPER_PRIVATE_KEY = keeperKey;
+  for (const [i, a] of extraAttesters.entries()) {
+    if (!(await vending.contract.isAttester(a.address))) {
+      await (await vending.contract.addAttester(a.address)).wait();
+      console.log(`[xode] attester ${a.address} added`);
+    }
+    out[`ATTESTER_${i + 2}_PRIVATE_KEY`] = extraAttesterKeys[i];
+  }
+  if ((await vending.contract.attestationThreshold()) !== ATTESTATION_THRESHOLD) {
+    await (await vending.contract.setAttestationThreshold(ATTESTATION_THRESHOLD)).wait();
+    console.log(`[xode] cross-chain payouts need ${ATTESTATION_THRESHOLD} of ${ATTESTERS} attesters`);
+  }
+  if ((await vending.contract.maxPerAddressPerDay()) !== ADDRESS_MAX_PER_DAY) {
+    await (await vending.contract.setAddressLimit(ADDRESS_MAX_PER_DAY)).wait();
+    console.log(`[xode] per-address limit: ${ADDRESS_MAX_PER_DAY === 0n ? "none" : `${ethers.formatUnits(ADDRESS_MAX_PER_DAY, 6)} USDT/day`}`);
+  }
   Object.assign(out, {
     VENDING_ADDRESS: vending.address,
     MAX_EXTERNAL_DEPOSIT_USDT: ethers.formatUnits(MAX_PER_DEPOSIT, 6),
@@ -285,6 +332,7 @@ async function main(): Promise<void> {
     const gateway = await deployOrReuse("assethub: EthUsdtGateway", gatewayArtifact, ahOwner,
       process.env.ASSETHUB_GATEWAY_ADDRESS, [precompileAddr(ASSET_ID), owner.address, roleOf("ASSETHUB_TREASURY", owner.address), roleOf("ASSETHUB_GUARDIAN", owner.address)]);
     await requireOwner("assethub", gateway.contract, owner.address);
+    await gatewayRules("assethub", gateway.contract);
     Object.assign(out, { ASSETHUB_EVM_RPC, ASSETHUB_GATEWAY_ADDRESS: gateway.address });
     if (gateway.deployBlock !== undefined) out.ASSETHUB_START_BLOCK = String(gateway.deployBlock);
   }
@@ -319,6 +367,7 @@ async function main(): Promise<void> {
     const gateway = await deployOrReuse("ethereum: EthUsdtGateway", gatewayArtifact, ethOwner,
       process.env.ETH_GATEWAY_ADDRESS, [ethUsdt, owner.address, roleOf("ETHEREUM_TREASURY", owner.address), roleOf("ETHEREUM_GUARDIAN", owner.address)]);
     await requireOwner("ethereum", gateway.contract, owner.address);
+    await gatewayRules("ethereum", gateway.contract);
     Object.assign(out, { ETHEREUM_RPC, ETH_GATEWAY_ADDRESS: gateway.address });
     if (gateway.deployBlock !== undefined) out.ETHEREUM_START_BLOCK = String(gateway.deployBlock);
   }

@@ -216,6 +216,43 @@ before recording it: it must have succeeded on the deposit's chain and moved at 
 deposited amount of that chain's USDT to the payer. If it was refunded some other way, use
 `--force --note "how"`; the note is kept in the ledger.
 
+For an AssetHub/Ethereum deposit there are two steps, in this order, both from the owner Safes:
+
+1. **Cancel it on Xode** (`npm run safe -- propose cancels --chain xode`). The vending contract
+   then never pays it out, and the cancel itself fails if it was already paid. This is what stops a
+   deposit from being both refunded and paid.
+2. **Refund it from its gateway** (`npm run safe -- propose refunds --chain ethereum`). The tool only
+   proposes, signs or executes a refund once the chain shows the deposit cancelled on Xode. That
+   holds for any proposal, `raw` ones included. A deposit whose own market-price minimum couldn't
+   be met is refunded less the gateway's `refundFee`; for any other failure it's refunded in full.
+   A depositor can name a different refund address with the gateway's `setRefundAddress`, for
+   example if USDT has frozen theirs.
+
+## Attesters, the change queue and other limits
+
+- **Attesters.** A cross-chain payout needs `attestationThreshold` of the vending contract's
+  attesters to vote for that exact deposit. Then any attester can execute it. Run one relayer
+  instance per attester key, ideally on different machines with different RPCs.
+  `ENABLE_XODE_ADAPTER=false` on all but the one holding the `relayer` key, which is the only key
+  allowed to settle Xode-native deposits. With one vote in, the relayer logs "waiting for other
+  attesters" and retries. Market-price swaps execute after a random wait of up to
+  `SETTLE_JITTER_MS` (default 15s), so their timing is harder to sandwich.
+- **Change queue.** Once a contract is handed over, a change that could pay out more has to be
+  queued with its exact calldata and waits 48 hours. That covers raising limits, the rate or the
+  refund fee, adding an attester, lowering the threshold, and appointing a relayer or keeper. Use
+  `npm run safe -- propose <action> --queue`, then the same command without `--queue` once
+  `npm run safe -- status` shows it `READY`. The guardian Safe can stop a queued change with
+  `propose cancel-change <id>`. Changes that only make things safer (lowering limits, removing an
+  attester, pausing) take effect immediately. Watch `status` for changes you didn't queue.
+- **Fixed-rate pause.** Past `RATE_PAUSE_BPS` (default: `RATE_ALERT_BPS`), the rate keeper pauses
+  `buy` and the fixed-rate deposit paths, and resumes them once the rate is back within half of
+  that. Market-price swaps keep working. Deposits that arrive during the pause are held; once it
+  lifts, pay them with `npm run settle-held`.
+- **Per-address limit.** `maxPerAddressPerDay` caps what one buyer or beneficiary can take per day
+  across every path, so a single party can't use up the shared allowance. A deposit over it is held.
+- **Minimum deposit.** The gateways refuse deposits under `minDeposit`, and the API refuses to
+  prepare them.
+
 ## Reconciliation
 
 `npm run reconcile` cross-checks the ledger against the chains (read-only) and exits `1` if it

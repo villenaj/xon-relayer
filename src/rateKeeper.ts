@@ -5,6 +5,10 @@
 // market with `updateRate` - signed by the rate keeper key (never the owner's), and bounded on-chain
 // by the contract's maxRateStepBps / minRateUpdateInterval, so a stolen keeper key can only move
 // the price slowly. Without a keeper key it only alerts when the rate drifts past RATE_ALERT_BPS.
+//
+// Stepping slowly also means a sudden market move leaves the rate stale for a while. So past
+// RATE_PAUSE_BPS the keeper also pauses the fixed-rate paths (`keeperPauseFixedRate`) - the
+// market-price swap keeps working - and lifts its pause once the rate is back within half of that.
 
 import { ethers } from "ethers";
 import type { Alerts } from "./alerts.js";
@@ -26,6 +30,15 @@ export function nextRate({ current, target, maxStepBps, deadbandBps }: { current
   if (maxStep === 0n) return null;
   const next = target > current ? (gap > maxStep ? current + maxStep : target) : (gap > maxStep ? current - maxStep : target);
   return next === current ? null : next;
+}
+
+/// Whether the keeper's fixed-rate pause should be on: on past `pauseBps`, off again only once the
+/// deviation is back within half of it (so it doesn't flap around the threshold).
+export function wantFixedRatePause({ offBps, pausedNow, pauseBps }: { offBps: bigint; pausedNow: boolean; pauseBps: bigint }): boolean {
+  if (pauseBps <= 0n) return false;
+  if (offBps > pauseBps) return true;
+  if (pausedNow && offBps > pauseBps / 2n) return true;
+  return false;
 }
 
 /// Basis points between `rate` and `target`, relative to the target.
@@ -79,6 +92,16 @@ export async function runRateKeeper({ settlement, config, dex, telemetry, alerts
       drifting = false;
     }
     if (!keeper) return;
+
+    const pausedNow: boolean = await keeper.fixedRatePausedByKeeper();
+    const pause = wantFixedRatePause({ offBps: off, pausedNow, pauseBps: config.ratePauseBps });
+    if (pause !== pausedNow) {
+      const receipt = await (await keeper.keeperPauseFixedRate(pause)).wait();
+      const message = pause
+        ? `[rate] Paused the fixed-rate paths (buy / fixed-rate deposits): ${describe()}. Market-price swaps carry on.`
+        : `[rate] Fixed-rate paths resumed: ${describe()}.`;
+      alerts.send(`${message} (tx ${receipt?.hash})`);
+    }
 
     const [maxStepBps, minInterval, last, block] = await Promise.all([
       keeper.maxRateStepBps() as Promise<bigint>, keeper.minRateUpdateInterval() as Promise<bigint>,

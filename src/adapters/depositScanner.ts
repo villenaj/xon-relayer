@@ -12,7 +12,7 @@ import path from "node:path";
 import { describeConfirmations, getSafeHead, scanLogs, type Confirmations } from "../chain.js";
 import { makeCheckpoint } from "../checkpoint.js";
 import { classifySettleError, describeError, type SettleErrorClassification } from "../errorClassifier.js";
-import { depositIdAt } from "../settlement.js";
+import { AwaitingQuorumError, depositIdAt } from "../settlement.js";
 import type { AdapterContext } from "./types.js";
 
 export interface Deposit {
@@ -141,6 +141,11 @@ export async function createDepositScanner(context: AdapterContext, source: Depo
           continue;
         }
         gate.release?.();
+        if (err instanceof AwaitingQuorumError) {
+          // Voted; the other attesters haven't yet. Not a failure - come back to it next tick.
+          console.log(`[${label}] ${tx}: ${err.message}`);
+          return log.blockNumber;
+        }
         let { kind, name } = classifySettleError(settlement.vending, err);
         if (kind === "transient" && source.diagnose) {
           try {
@@ -166,7 +171,12 @@ export async function createDepositScanner(context: AdapterContext, source: Depo
         }
         if (kind === "held") {
           const release = `npm run settle-held -- ${tx}${deposit.depositIndex > 0 ? ` --index ${deposit.depositIndex}` : ""}`;
-          alerts.send(`[${label}] Held deposit ${tx}: ${name} - it's over XonVendingMachine's own limit. To pay it, raise the limit with setExternalLimits (owner key), then: ${release}`);
+          const why = name === "FixedRatePaused"
+            ? "the fixed-rate paths are paused (the fixed rate is off the DEX price). Pay it once they're resumed"
+            : name === "OverAddressDailyLimit"
+              ? "it's over this buyer's per-address daily limit. Pay it once that has refilled (or the limit is raised - a queued change)"
+              : "it's over XonVendingMachine's own limit. Raise the limit (setExternalLimits / setNativeLimits - a queued change), then pay it";
+          alerts.send(`[${label}] Held deposit ${tx}: ${name} - ${why}: ${release}`);
           ledger.record({ ...entry, status: "held", error: name });
           continue;
         }

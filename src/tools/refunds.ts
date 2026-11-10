@@ -39,8 +39,14 @@ async function list(showAll: boolean): Promise<void> {
     console.log(`${r.sourceChain.padEnd(9)} ${r.sourceTxHash}${index}  ${usdt(BigInt(r.usdtAmount))}  (${r.error ?? "skipped"}, ${r.time})`);
     try {
       const t = await refundTarget(r);
-      if (t.refundCall) {
-        console.log(`          refund ${usdt(BigInt(r.usdtAmount))} to ${t.payer} on ${r.sourceChain}: have the gateway owner (e.g. its Safe) call`);
+      if (t.onXode?.paid) {
+        console.log(`          !! already PAID on Xode (${t.depositId}) - do NOT refund; mark it settled after checking.`);
+      } else if (t.refundCall) {
+        if (!t.onXode?.cancelled) {
+          console.log(`          1. cancel it on Xode first (ops Safe: npm run safe -- propose cancels --chain xode), or call`);
+          console.log(`            to:   ${t.cancelCall!.to}\n            data: ${t.cancelCall!.data}`);
+        }
+        console.log(`          ${t.onXode?.cancelled ? "" : "2. "}refund ${usdt(BigInt(r.usdtAmount))}${t.chargeFee ? " less the refund fee (its minimum wasn't met)" : " in full"} to ${t.payer} on ${r.sourceChain}: have the gateway owner (e.g. its Safe) call`);
         console.log(`            to:   ${t.refundCall.to}\n            data: ${t.refundCall.data}`);
       } else {
         console.log(`          refund ${usdt(BigInt(r.usdtAmount))} (token ${t.usdtAddress}) to ${t.payer} on ${r.sourceChain}, from ${t.heldBy} using its owner key`);

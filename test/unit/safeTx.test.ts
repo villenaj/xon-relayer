@@ -11,7 +11,7 @@ const SAFE = "0x8c827b1DbF504b1dE7E87166d39163149fdDD558";
 const MULTISEND = "0x9641d764fc13c8B624c04430C7356C1C7C8102e2";
 const GATEWAY = "0x00000000000000000000000000000000000000cc";
 const gateway = new ethers.Interface(GATEWAY_ABI);
-const refund = (n: bigint): Call => ({ to: GATEWAY, value: 0n, data: gateway.encodeFunctionData("refund", [n, "0x1111111111111111111111111111111111111111", 2_000_000n]) });
+const refund = (n: bigint): Call => ({ to: GATEWAY, value: 0n, data: gateway.encodeFunctionData("refund", [n, "0x1111111111111111111111111111111111111111", 2_000_000n, false]) });
 const owners = [0, 1, 2].map(() => ethers.Wallet.createRandom());
 
 test("the EIP-712 hash is exactly Safe 1.4.1's own getTransactionHash", () => {
@@ -102,7 +102,7 @@ test("proposals that refund gas out of the Safe are refused", async () => {
 });
 
 test("calls are shown decoded for review", () => {
-  assert.equal(describeCall(refund(3n), { [ethers.getAddress(GATEWAY)]: "gateway" }), "gateway.refund(3, 0x1111111111111111111111111111111111111111, 2000000)");
+  assert.equal(describeCall(refund(3n), { [ethers.getAddress(GATEWAY)]: "gateway" }), "gateway.refund(3, 0x1111111111111111111111111111111111111111, 2000000, false)");
   assert.equal(describeCall({ to: GATEWAY, value: 0n, data: gateway.encodeFunctionData("withdraw", [5n]) }), `${GATEWAY}.withdraw(5)`);
   assert.match(describeCall({ to: GATEWAY, value: 0n, data: "0xdeadbeef00" }), /not a known call/);
   const erc20 = new ethers.Interface(["function transfer(address,uint256)"]);

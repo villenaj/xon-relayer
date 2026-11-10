@@ -57,6 +57,8 @@ async function main(): Promise<void> {
     expectedChainId: config.xodeChainId,
     rpcTimeoutMs: config.rpcTimeoutMs,
     allowOwnerAsRelayer: config.allowOwnerAsRelayer,
+    roles: { native: config.adapters.xode, external: config.adapters.assetHub || config.adapters.ethereum },
+    settleJitterMs: config.settleJitterMs,
   });
   console.log(`Relayer address: ${settlement.relayerAddress} (key from ${relayerKey.source})`);
   console.log(`Vending contract: ${config.vendingAddress} on Xode chain ${settlement.chainId}`);

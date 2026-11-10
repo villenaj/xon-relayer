@@ -4,12 +4,20 @@
 //
 //   npm run safe -- status   --chain <xode|assethub|ethereum> [--safe ops]
 //   npm run safe -- propose  <action> --chain <c> [--safe ops] [--nonce n] [--out file]
+//        cancels                       (xode) cancel every deposit awaiting a refund, so it can never be paid -
+//                                      a refund is only proposed, signed or executed once its deposit is cancelled
 //        refunds                       every deposit awaiting a refund on that chain (batched)
 //        refund <source tx> [--index n]
 //        withdraw <amount> [--asset xon|usdt]   to the treasury (the only place it can go)
 //        pause | unpause               (ops)          guardian-pause | cancel-treasury   (guardian)
 //        limits --external <perDeposit>,<perDay> | --native <perPurchase>,<perDay>   (Xode, USDT)
+//        attester add|remove <address> | threshold <n> | rate <xon per usdt> | address-limit <usdt>   (xode)
+//        fixed-rate pause|resume (xode)  |  min-deposit <usdt> | refund-fee <usdt>   (gateways)
+//        cancel-change <id>            (guardian) stop a queued change
 //        raw --to <address> --data <hex> [--value <wei>]
+//     add --queue to queue the calls instead (risky changes - raising limits / the rate / the refund fee,
+//     adding an attester, lowering the threshold, a new relayer or keeper - must wait 48h; run the same
+//     propose again without --queue once `status` shows them ready)
 //   npm run safe -- show       <file>      what it does, who has signed
 //   npm run safe -- typed-data <file>      EIP-712 JSON to sign in a wallet (eth_signTypedData_v4)
 //   npm run safe -- sign       <file> [--signature <hex>]   key from SAFE_SIGNER_KEY_FILE, or a wallet's signature
@@ -29,7 +37,7 @@ import {
   verifyProposal, type Call, type Proposal,
 } from "../safe/safeTx.js";
 import { option, runTool } from "./common.js";
-import { awaitingRefund, refundTarget } from "./refundTargets.js";
+import { awaitingRefund, gatewayDeposit, refundTarget, xodeStatus } from "./refundTargets.js";
 import GATEWAY_ABI from "../abi/EthUsdtGateway.json" with { type: "json" };
 import VENDING_ABI from "../abi/XonVendingMachine.json" with { type: "json" };
 
@@ -95,6 +103,23 @@ async function context(chain: ChainName, role: string) {
 async function proposeCalls(action: string, args: string[], chain: ChainName, target: ReturnType<typeof chainTarget>): Promise<{ calls: Call[]; description: string }> {
   const call = (fn: string, params: unknown[] = []): Call => ({ to: target.contract, value: 0n, data: target.iface.encodeFunctionData(fn, params) });
   switch (action) {
+    case "cancels": {
+      if (target.kind !== "vending") throw new Error("Deposits are cancelled on Xode's vending contract (--chain xode).");
+      const calls: Call[] = [];
+      for (const r of awaitingRefund(readLedger(config.ledgerFile)).filter((x) => x.sourceChain !== "xode")) {
+        const label = `${r.sourceChain} ${r.sourceTxHash}${(r.depositIndex ?? 0) > 0 ? ` #${r.depositIndex}` : ""}`;
+        try {
+          const t = await refundTarget(r);
+          if (t.onXode?.paid) { console.warn(`!! ${label} was already PAID on Xode - it must not be refunded.`); continue; }
+          if (t.onXode?.cancelled) continue;
+          calls.push({ to: t.cancelCall!.to, value: 0n, data: t.cancelCall!.data });
+        } catch (err) {
+          console.warn(`Leaving out ${label}: ${err instanceof Error ? err.message : err}`);
+        }
+      }
+      if (calls.length === 0) throw new Error("No deposits awaiting a refund that still need cancelling on Xode.");
+      return { calls, description: `Cancel ${calls.length} deposit(s) on Xode so they can be refunded on their source chains` };
+    }
     case "refunds":
     case "refund": {
       if (target.kind !== "gateway") throw new Error("Refunds are paid from the gateways (assethub / ethereum).");
@@ -110,6 +135,8 @@ async function proposeCalls(action: string, args: string[], chain: ChainName, ta
         try {
           const t = await refundTarget(r);
           if (!t.refundCall) throw new Error("its gateway has no refund() - refund it the old way");
+          if (t.onXode?.paid) throw new Error("it was already PAID on Xode - never refund it");
+          if (!t.onXode?.cancelled) throw new Error("not cancelled on Xode yet - propose cancels --chain xode, and execute that first");
           calls.push({ to: t.refundCall.to, value: 0n, data: t.refundCall.data });
         } catch (err) {
           // One deposit that can't be resolved (e.g. on a retired gateway) mustn't block the rest.
@@ -143,6 +170,25 @@ async function proposeCalls(action: string, args: string[], chain: ChainName, ta
       if (calls.length === 0) throw new Error("limits --external <perDeposit>,<perDay> and/or --native <perPurchase>,<perDay>");
       return { calls, description: "Change payout limits" };
     }
+    case "attester": {
+      if (target.kind !== "vending") throw new Error("Attesters are on the vending contract (--chain xode).");
+      const [op, who] = args;
+      if ((op !== "add" && op !== "remove") || !who || !ethers.isAddress(who)) throw new Error("attester add|remove <address>");
+      return { calls: [call(op === "add" ? "addAttester" : "removeAttester", [ethers.getAddress(who)])], description: `${op === "add" ? "Add" : "Remove"} attester ${who}` };
+    }
+    case "threshold": return { calls: [call("setAttestationThreshold", [BigInt(args[0])])], description: `Attestation threshold ${args[0]}` };
+    case "rate": return { calls: [call("setRate", [ethers.parseEther(args[0])])], description: `Fixed rate ${args[0]} XON per USDT` };
+    case "address-limit": return { calls: [call("setAddressLimit", [usdtUnits(args[0])])], description: `Per-address daily limit ${args[0]} USDT` };
+    case "fixed-rate": {
+      if (args[0] !== "pause" && args[0] !== "resume") throw new Error("fixed-rate pause|resume");
+      return { calls: [call("setFixedRatePaused", [args[0] === "pause"])], description: `${args[0] === "pause" ? "Pause" : "Resume"} the fixed-rate paths` };
+    }
+    case "min-deposit": return { calls: [call("setMinDeposit", [usdtUnits(args[0])])], description: `Minimum deposit ${args[0]} USDT` };
+    case "refund-fee": return { calls: [call("setRefundFee", [usdtUnits(args[0])])], description: `Refund fee ${args[0]} USDT` };
+    case "cancel-change": {
+      if (!args[0] || !ethers.isHexString(args[0], 32)) throw new Error("cancel-change <id> (from status)");
+      return { calls: [call("cancelChange", [args[0]])], description: `Cancel queued change ${args[0]}` };
+    }
     case "raw": {
       const to = option(args, "--to"), data = option(args, "--data") ?? "0x";
       if (!to || !ethers.isAddress(to) || !ethers.isHexString(data)) throw new Error("raw --to <address> --data <hex> [--value <wei>]");
@@ -156,9 +202,15 @@ async function proposeCalls(action: string, args: string[], chain: ChainName, ta
 async function propose(args: string[]): Promise<void> {
   const [action, ...rest] = args;
   const chain = chainOf(option(rest, "--chain"));
-  const role = option(rest, "--safe") ?? (action === "guardian-pause" || action === "cancel-treasury" ? "guardian" : "ops");
+  const role = option(rest, "--safe") ?? (["guardian-pause", "cancel-treasury", "cancel-change"].includes(action) ? "guardian" : "ops");
   const ctx = await context(chain, role);
-  const { calls, description } = await proposeCalls(action, rest.filter((a) => !a.startsWith("--chain") && a !== chain), chain, ctx.target);
+  const proposed = await proposeCalls(action, rest.filter((a) => !a.startsWith("--chain") && a !== chain && a !== "--queue"), chain, ctx.target);
+  let { calls, description } = proposed;
+  if (rest.includes("--queue")) {
+    // Each call is queued with its exact calldata; the same propose without --queue runs it in 48h.
+    calls = calls.map((c) => ({ to: c.to, value: 0n, data: ctx.target.iface.encodeFunctionData("queueChange", [c.data]) }));
+    description = `Queue (runs in 48h unless the guardian cancels): ${description}`;
+  }
   const { call, operation } = bundle(calls, ctx.multiSend);
   const nonce = option(rest, "--nonce") !== undefined ? BigInt(option(rest, "--nonce")!) : await ctx.safe.nonce();
   const { chainId } = await ctx.provider.getNetwork();
@@ -216,7 +268,26 @@ async function checked(file: string | undefined) {
   if (onChainHash !== p.safeTxHash) throw new Error("The Safe computes a different hash for this transaction - refusing.");
   const [owners, threshold, nonce] = await Promise.all([ctx.safe.getOwners() as Promise<string[]>, ctx.safe.getThreshold() as Promise<bigint>, ctx.safe.nonce() as Promise<bigint>]);
   if (tx.nonce < nonce) throw new Error(`The Safe is already at nonce ${nonce}; this proposal (nonce ${tx.nonce}) is spent or stale.`);
+  if (!p.executed) await guardRefunds(p, chain, ctx.provider);
   return { p, tx, ctx, names: ctx.names, owners: owners.map((o) => ethers.getAddress(o)), threshold, nonce };
+}
+
+/// No refund goes out - whoever proposed it, however it was built (even `raw`) - unless its deposit
+/// is cancelled on Xode, which in turn is only possible while it hasn't been paid there. Checked from
+/// the chains themselves at sign time and again at execute time.
+async function guardRefunds(p: Proposal, chain: ChainName, provider: ethers.JsonRpcProvider): Promise<void> {
+  if (chain === "xode") return;
+  const gateway = new ethers.Interface(GATEWAY_ABI);
+  for (const c of p.calls) {
+    let parsed: ethers.TransactionDescription | null = null;
+    try { parsed = gateway.parseTransaction({ data: c.data }); } catch { parsed = null; }
+    if (parsed?.name !== "refund") continue;
+    const nonce: bigint = parsed.args[0];
+    const deposit = await gatewayDeposit(provider, ethers.getAddress(c.to), chain, nonce);
+    const { paid, cancelled } = await xodeStatus(deposit.depositId);
+    if (paid) throw new Error(`Deposit #${nonce} (${deposit.txHash}) was PAID on Xode - refusing a refund of it.`);
+    if (!cancelled) throw new Error(`Deposit #${nonce} (${deposit.txHash}) isn't cancelled on Xode yet - execute the cancel first (propose cancels --chain xode).`);
+  }
 }
 
 async function sign(args: string[]): Promise<void> {
@@ -271,6 +342,26 @@ async function status(args: string[]): Promise<void> {
   const t = new ethers.Contract(ctx.target.contract, ctx.target.iface, ctx.provider);
   const [owner, treasury, guardian, paused] = await Promise.all([t.owner(), t.treasury(), t.guardian(), t.paused()]);
   console.log(`${ctx.target.kind} ${ctx.target.contract}: owner ${ctx.names[ethers.getAddress(owner)] ?? owner}, treasury ${ctx.names[ethers.getAddress(treasury)] ?? treasury}, guardian ${ctx.names[ethers.getAddress(guardian)] ?? guardian}${paused ? ", PAUSED" : ""}`);
+  if (ctx.target.kind === "vending") {
+    const [count, threshold_, fixedPaused, addressLimit] = await Promise.all([t.attesterCount(), t.attestationThreshold(), t.fixedRatePaused(), t.maxPerAddressPerDay()]);
+    console.log(`  attesters: ${threshold_} of ${count} must vote; fixed-rate paths ${fixedPaused ? "PAUSED" : "open"}; per-address limit ${addressLimit === 0n ? "none" : `${ethers.formatUnits(addressLimit, USDT_DECIMALS)} USDT/day`}`);
+  } else {
+    const [minDeposit, refundFee] = await Promise.all([t.minDeposit(), t.refundFee()]);
+    console.log(`  minimum deposit ${ethers.formatUnits(minDeposit, USDT_DECIMALS)} USDT, refund fee ${ethers.formatUnits(refundFee, USDT_DECIMALS)} USDT`);
+  }
+  // Queued changes still pending: what a compromised owner would have to announce 48h ahead.
+  const now = BigInt((await ctx.provider.getBlock("latest"))!.timestamp);
+  const queued = await t.queryFilter(t.filters.ChangeQueued(), 0, "latest");
+  const seen = new Set<string>();
+  for (const e of queued.reverse()) {
+    const { id, call } = (e as ethers.EventLog).args;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const readyAt: bigint = await t.queuedChangeReadyAt(id);
+    if (readyAt === 0n) continue;
+    const when = readyAt <= now ? "READY" : `ready in ${((readyAt - now) / 3600n).toString()}h`;
+    console.log(`  queued ${id}: ${describeCall({ to: ctx.target.contract, value: 0n, data: call }, ctx.names)} - ${when}`);
+  }
 }
 
 runTool(async () => {
