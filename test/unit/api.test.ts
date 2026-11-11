@@ -53,14 +53,14 @@ test("a Xode purchase is one USDT transfer into the vending contract, paid to th
 });
 
 test("a gateway purchase approves only what's missing, then deposits for the beneficiary", () => {
-  const steps = purchaseSteps(assetHub, BUYER, 5_000_000n, BENEFICIARY, 0n);
+  const steps = purchaseSteps(assetHub, BUYER, 5_000_000n, BENEFICIARY, 0n, undefined, 970_000_000_000_000_000n);
   assert.deepEqual(steps.map((s) => s.kind), ["approve", "deposit"]);
   assert.equal(steps[0].tx.to, USDT);
   assert.deepEqual([...usdt.interface.decodeFunctionData("approve", steps[0].tx.data)], [GATEWAY, 5_000_000n]);
   assert.equal(steps[1].tx.to, GATEWAY);
-  assert.deepEqual([...gateway.interface.decodeFunctionData("deposit", steps[1].tx.data)], [5_000_000n, BENEFICIARY]);
+  assert.deepEqual([...gateway.interface.decodeFunctionData("deposit", steps[1].tx.data)], [5_000_000n, BENEFICIARY, 970_000_000_000_000_000n], "the deposit carries the buyer's minimum");
 
-  const approved = purchaseSteps(assetHub, BUYER, 5_000_000n, BENEFICIARY, 5_000_000n);
+  const approved = purchaseSteps(assetHub, BUYER, 5_000_000n, BENEFICIARY, 5_000_000n, undefined, 1n);
   assert.deepEqual(approved.map((s) => s.kind), ["deposit"], "enough allowance already - no approve");
 });
 
@@ -89,7 +89,7 @@ test("deposits are read from a tx's logs in log order, with the relayer's deposi
   assert.deepEqual(fromXode.map((d) => [d.usdtAmount, d.depositId]), [[1_000_000n, TX], [2_000_000n, depositIdAt(TX, 1)]]);
   assert.equal(fromXode[0].beneficiary, BUYER);
 
-  const deposited = gateway.interface.encodeEventLog("Deposited", [BUYER, BENEFICIARY, 3_000_000n, 1n]);
+  const deposited = gateway.interface.encodeEventLog("Deposited", [BUYER, BENEFICIARY, 3_000_000n, 1n, 1n]);
   const fromEthereum = depositsInLogs(ethereum, TX, [log(GATEWAY, deposited.topics, deposited.data, 0), log(USDT, [DEPOSITED_TOPIC], "0x", 1)]);
   assert.equal(fromEthereum.length, 1, "Deposited events only count from the gateway");
   assert.equal(fromEthereum[0].beneficiary, BENEFICIARY);

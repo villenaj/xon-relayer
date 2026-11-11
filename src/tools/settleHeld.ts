@@ -188,7 +188,7 @@ async function releaseExternal(held: LedgerRecord): Promise<void> {
 
   try {
     const settleReceipt = minXonOut === undefined
-      ? await settlement.settleExternal(buyer, usdtAmount, held.sourceChain, depositId, LABEL)
+      ? await settlement.settleExternal(buyer, usdtAmount, deposit.fixedMinXonOut ?? 1n, held.sourceChain, depositId, LABEL)
       : await settlement.settleExternalSwap(buyer, usdtAmount, minXonOut, held.sourceChain, depositId, LABEL);
     ledger.record({ ...entry, status: "settled", settleTxHash: settleReceipt.hash, settleBlock: settleReceipt.blockNumber });
   } catch (err) {

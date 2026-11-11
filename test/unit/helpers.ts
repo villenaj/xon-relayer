@@ -31,7 +31,7 @@ export function fakeContext(checkpointDir: string): AdapterContext & { entries: 
   const alertsSent: string[] = [];
   const context = {
     settlement: { vending },
-    config: { checkpointDir, logChunkSize: 100, pollIntervalMs: 1 },
+    config: { checkpointDir, logChunkSize: 100, pollIntervalMs: 0 },
     ledger: { record: (e: LedgerEntry) => entries.push(e) },
     alerts: { send: (message: string) => alertsSent.push(message) },
     telemetry: { settleAttempt: () => {} },

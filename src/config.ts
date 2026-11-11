@@ -55,6 +55,12 @@ function optionalChainId(name: string): bigint | null {
 
 const checkpointDir = process.env.CHECKPOINT_DIR ?? ".checkpoints";
 
+function marketRoute(value: string | undefined): "xcm" | "gateway" {
+  if (value === undefined || value === "") return "xcm";
+  if (value !== "xcm" && value !== "gateway") throw new Error(`ASSETHUB_MARKET_ROUTE must be "xcm" or "gateway" (got "${value}").`);
+  return value;
+}
+
 /// A signing key from the first of these that's set (exactly one may be):
 ///   1. the systemd credential `credential` ($CREDENTIALS_DIRECTORY/<credential>) - production,
 ///      encrypted at rest via LoadCredentialEncrypted (see systemd/xon-relayer.service);
@@ -195,6 +201,21 @@ export const config = {
   apiPort: Number(process.env.API_PORT ?? 8080),
   // Origins allowed to call the API from a browser (comma-separated, or "*"). Empty allows none.
   apiCorsOrigins: (process.env.API_CORS_ORIGINS ?? "").split(",").map((o) => o.trim()).filter(Boolean),
+  // How far the fixed rate may drop between a gateway deposit being prepared and being settled
+  // before the deposit is refunded instead of paid less: the deposit carries the quote less this
+  // as its minimum (basis points). The rate keeper moves the rate by at most a few percent at a time.
+  fixedRateToleranceBps: Number(process.env.FIXED_RATE_TOLERANCE_BPS ?? 300),
+  // Market-price purchases from AssetHub. "xcm" (default): one call to AssetHub's XCM precompile
+  // moves the buyer's USDT to Xode and swaps it on the DEX on arrival - no gateway, no relayer, no
+  // USDT inventory (see xcmSwap.ts; needs XODE_SUBSTRATE_RPC). "gateway": the older
+  // depositForSwap into the AssetHub gateway, paid by the relayer from the vending contract.
+  // Fixed-rate AssetHub purchases always use the gateway.
+  assetHubMarketRoute: marketRoute(process.env.ASSETHUB_MARKET_ROUTE),
+  // Xode's parachain id - where the XCM route sends the USDT.
+  xodeParaId: Number(process.env.XODE_PARA_ID ?? 3417),
+  // XCM-route purchases the API has seen settle, for /api/deposits (the relayer's ledger never
+  // sees them: nothing of theirs passes through the relayer).
+  xcmPurchasesFile: process.env.XCM_PURCHASES_FILE ?? path.join(checkpointDir, "xcm-purchases.jsonl"),
   // Cap on open event streams (tx waits + address watches) across all clients.
   apiMaxStreams: Number(process.env.API_MAX_STREAMS ?? 500),
   // How often the API's block scanner polls each chain while someone is subscribed.
@@ -243,6 +264,22 @@ export const config = {
 
 export type Config = typeof config;
 
+/// The relayer (the process that signs payouts) must be told which chain each RPC is supposed to
+/// be: a deposit id names its source only by label ("ethereum", "assethub"), so an RPC URL that
+/// points at the wrong network - a testnet, a fork - would have its deposits attested and paid in
+/// real XON. With the chain IDs set, startup refuses an RPC that reports another chain. The API and
+/// the tools don't sign anything and may run without them.
+export function requireChainIds(): void {
+  const missing = [
+    config.xodeChainId === null ? "XODE_CHAIN_ID" : null,
+    config.assetHub.rpcUrl && config.assetHub.gatewayAddress && config.assetHub.chainId === null ? "ASSETHUB_CHAIN_ID" : null,
+    config.ethereum.rpcUrl && config.ethereum.gatewayAddress && config.ethereum.chainId === null ? "ETHEREUM_CHAIN_ID" : null,
+  ].filter((name): name is string => name !== null);
+  if (missing.length > 0) {
+    throw new Error(`${missing.join(", ")} must be set: the relayer only pays deposits from RPCs that report the chain ID it was told to expect (Polkadot AssetHub is 420420419, Ethereum mainnet 1).`);
+  }
+}
+
 export function validateConfig(): void {
   const positiveIntegers = {
     POLL_INTERVAL_MS: config.pollIntervalMs,
@@ -266,6 +303,12 @@ export function validateConfig(): void {
   }
   if (!Number.isInteger(config.apiPort) || config.apiPort < 1 || config.apiPort > 65535) {
     throw new Error(`API_PORT must be a port number (got "${process.env.API_PORT}").`);
+  }
+  if (!Number.isInteger(config.fixedRateToleranceBps) || config.fixedRateToleranceBps < 0 || config.fixedRateToleranceBps > 2000) {
+    throw new Error(`FIXED_RATE_TOLERANCE_BPS must be a whole number of basis points from 0 to 2000 (got "${process.env.FIXED_RATE_TOLERANCE_BPS}").`);
+  }
+  if (!Number.isInteger(config.xodeParaId) || config.xodeParaId < 1 || config.xodeParaId > 0xffffffff) {
+    throw new Error(`XODE_PARA_ID must be a parachain id (got "${process.env.XODE_PARA_ID}").`);
   }
   if (config.xodeSubstrateRpc && !/^wss?:\/\//.test(config.xodeSubstrateRpc)) {
     throw new Error(`XODE_SUBSTRATE_RPC must be a ws:// or wss:// URL (got "${config.xodeSubstrateRpc}").`);

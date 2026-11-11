@@ -5,10 +5,12 @@
 // A purchase is one transaction on Xode (USDT `transfer` straight into XonVendingMachine - the
 // sender gets the XON) and up to three elsewhere: `approve(0)` where USDT insists on it, then
 // `approve`, then `UsdtGateway.deposit` naming the Xode beneficiary - or `depositForSwap`, which also
-// names the least XON the buyer accepts, to be paid at the Xode DEX's market price.
+// names the least XON the buyer accepts, to be paid at the Xode DEX's market price. A market-price
+// purchase from AssetHub is instead one call to its XCM precompile (see xcmSwap.ts).
 
 import { ethers } from "ethers";
 import { USDT_DECIMALS } from "../config.js";
+import { decodeExecuteCall, decodeXcmSwap, encodeExecuteCall, encodeXcmSwap, PLANCK_TO_WEI, XCM_PRECOMPILE, type XcmSwapParams, type XcmWeight } from "../xcmSwap.js";
 import { ApiError } from "./http.js";
 import type { Network } from "./networks.js";
 
@@ -22,12 +24,13 @@ export interface UnsignedTx {
 }
 
 export interface TxStep {
-  kind: "approve" | "deposit" | "transfer";
+  /// "swap": AssetHub's XCM precompile `execute` - the whole market-price purchase in one call.
+  kind: "approve" | "deposit" | "transfer" | "swap";
   description: string;
   tx: UnsignedTx;
 }
 
-type StepNetwork = Pick<Network, "name" | "chainId" | "usdt" | "usdtAddress" | "payTo" | "gateway" | "approveResetsToZero">;
+type StepNetwork = Pick<Network, "name" | "chainId" | "usdt" | "usdtAddress" | "payTo" | "gateway" | "approveResetsToZero"> & Partial<Pick<Network, "xcmSwap">>;
 
 /// A USDT amount as given by the front-end ("10", "12.5"), in raw units.
 export function parseUsdt(value: unknown, field = "amount"): bigint {
@@ -55,11 +58,11 @@ export function parseXon(value: unknown, field: string): bigint {
   return amount;
 }
 
-/// Slippage tolerance in basis points (100 = 1%), from 1 to 5000.
+/// Slippage tolerance in basis points (100 = 1%), from 1 to 1000.
 export function parseSlippageBps(value: unknown): bigint {
   const text = String(value ?? "");
-  if (!/^\d+$/.test(text) || Number(text) < 1 || Number(text) > 5000) {
-    throw new ApiError(400, "InvalidSlippage", `slippageBps must be a whole number of basis points from 1 to 5000 (100 = 1%), got "${value}".`);
+  if (!/^\d+$/.test(text) || Number(text) < 1 || Number(text) > 1000) {
+    throw new ApiError(400, "InvalidSlippage", `slippageBps must be a whole number of basis points from 1 to 1000 (100 = 1%), got "${value}".`);
   }
   return BigInt(text);
 }
@@ -96,15 +99,17 @@ export function approveSteps(network: StepNetwork, from: string, amount: bigint,
   return steps;
 }
 
-/// The gateway deposit: `deposit` (fixed rate), or with `minXonOut` set, `depositForSwap` (market
-/// price, at least `minXonOut` XON or a refund).
-export function depositStep(network: StepNetwork, from: string, amount: bigint, beneficiary: string, minXonOut?: bigint): TxStep {
+/// The gateway deposit: `deposit` (fixed rate - `fixedMinXonOut` is the least XON the buyer
+/// accepts if the rate drops before it settles), or with `minXonOut` set, `depositForSwap` (market
+/// price, at least `minXonOut` XON). Either way, below the minimum it's refunded instead.
+export function depositStep(network: StepNetwork, from: string, amount: bigint, beneficiary: string, minXonOut?: bigint, fixedMinXonOut?: bigint): TxStep {
   if (!network.gateway) throw new ApiError(400, "NoGateway", "Xode has no gateway - use a buy (a USDT transfer to the vending contract) instead.");
   if (minXonOut === undefined) {
+    if (fixedMinXonOut === undefined || fixedMinXonOut <= 0n) throw new Error("a fixed-rate gateway deposit needs the buyer's minimum");
     return {
       kind: "deposit",
-      description: `Deposit ${usdt(amount)} into the gateway; XON is paid to ${beneficiary} on Xode`,
-      tx: unsigned(network, from, network.payTo, network.gateway.interface.encodeFunctionData("deposit", [amount, beneficiary])),
+      description: `Deposit ${usdt(amount)} into the gateway; at least ${ethers.formatEther(fixedMinXonOut)} XON is paid to ${beneficiary} on Xode at the fixed rate, or the USDT is refunded`,
+      tx: unsigned(network, from, network.payTo, network.gateway.interface.encodeFunctionData("deposit", [amount, beneficiary, fixedMinXonOut])),
     };
   }
   return {
@@ -123,11 +128,32 @@ export function transferStep(network: StepNetwork, from: string, amount: bigint)
 }
 
 /// Every transaction a purchase needs, in the order they must be sent.
-export function purchaseSteps(network: StepNetwork, from: string, amount: bigint, beneficiary: string, allowance: bigint, minXonOut?: bigint): TxStep[] {
+export function purchaseSteps(network: StepNetwork, from: string, amount: bigint, beneficiary: string, allowance: bigint, minXonOut?: bigint, fixedMinXonOut?: bigint): TxStep[] {
   if (!network.gateway) {
     // On Xode the payout goes to whoever sent the USDT - there's nowhere to name anyone else.
     if (beneficiary !== from) throw new ApiError(400, "BeneficiaryNotSupported", "On Xode, XON is always paid to the sender - send from the address that should receive it.");
     return [transferStep(network, from, amount)];
   }
-  return [...approveSteps(network, from, amount, allowance), depositStep(network, from, amount, beneficiary, minXonOut)];
+  return [...approveSteps(network, from, amount, allowance), depositStep(network, from, amount, beneficiary, minXonOut, fixedMinXonOut)];
+}
+
+/// A market-price purchase from AssetHub: one `execute` call to the XCM precompile with the swap
+/// program (xcmSwap.ts). `params.paraId` must be this network's configured Xode para id.
+export function swapStep(network: StepNetwork, from: string, params: XcmSwapParams, weight: XcmWeight, beneficiary: string): TxStep {
+  if (!network.xcmSwap) throw new ApiError(400, "SwapNotSupported", `Market-price purchases from ${network.name} don't go over XCM.`);
+  if (params.paraId !== network.xcmSwap.paraId) throw new Error(`XCM swap built for para ${params.paraId}, but Xode is ${network.xcmSwap.paraId}`);
+  const data = encodeExecuteCall(encodeXcmSwap(params), weight);
+  const minXon = ethers.formatEther(params.minXonPlanck * PLANCK_TO_WEI);
+  return {
+    kind: "swap",
+    description: `Send ${usdt(params.usdtAmount)} to Xode and swap it on the DEX; at least ${minXon} XON is paid to ${beneficiary} on Xode, or the USDT (less Xode's fee) is left with ${beneficiary} on Xode instead`,
+    tx: unsigned(network, from, XCM_PRECOMPILE, data),
+  };
+}
+
+/// The swap a precompile call carries, if `data` is exactly an `execute` of the swap program.
+export function swapInCall(data: string): { params: XcmSwapParams; weight: XcmWeight } | null {
+  const call = decodeExecuteCall(data);
+  const params = call ? decodeXcmSwap(call.message) : null;
+  return call && params ? { params, weight: call.weight } : null;
 }

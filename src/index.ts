@@ -1,6 +1,6 @@
 import { ethers } from "ethers";
 import type { Server } from "node:http";
-import { config, loadRateKeeperKey, loadRelayerKey, USDT_DECIMALS, validateConfig } from "./config.js";
+import { config, loadRateKeeperKey, loadRelayerKey, requireChainIds, USDT_DECIMALS, validateConfig } from "./config.js";
 import { acquireInstanceLock } from "./instanceLock.js";
 import { createSettlementClient, type SettlementClient } from "./settlement.js";
 import { makeLedger, readLedger, type Ledger } from "./ledger.js";
@@ -17,6 +17,7 @@ import { runRateKeeper } from "./rateKeeper.js";
 
 async function main(): Promise<void> {
   validateConfig();
+  requireChainIds();
   acquireInstanceLock(config.checkpointDir);
   const relayerKey = loadRelayerKey();
   if (relayerKey.source.startsWith("RELAYER_PRIVATE_KEY env")) {

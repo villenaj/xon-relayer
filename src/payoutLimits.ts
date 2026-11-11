@@ -5,6 +5,8 @@
 //     instead of being paid automatically. It doesn't block later deposits.
 //   - per rolling 24h, across both external chains: once reached, those adapters pause (stall and
 //     retry) until older payouts age out of the window.
+// With several attesters each instance keeps its own window, but counts every payout it sees -
+// its own and the ones another instance executed - so the cap is on the total, not on its share.
 // These run inside the relayer, so they don't protect against a stolen relayer key - that's what
 // XonVendingMachine's own on-chain limits (setExternalLimits) are for. Keep these at or below those.
 
@@ -23,6 +25,8 @@ export interface PayoutLimiter {
   /// Counts the amount against the 24h window. Returns a function that un-counts it (call it if
   /// the settle doesn't go through), or null if it would exceed the 24h cap right now.
   reserve(usdtAmount: bigint): (() => void) | null;
+  /// Counts a payout someone else made (another attester's instance) against the 24h window.
+  note(usdtAmount: bigint): void;
   /// USDT counted in the current window, for logging.
   usedInWindow(): bigint;
 }
@@ -30,9 +34,19 @@ export interface PayoutLimiter {
 /// `history` seeds the 24h window with what was already paid out (from the ledger), so a restart
 /// doesn't hand out a fresh day's allowance.
 export function makePayoutLimiter(limits: PayoutLimitsConfig, history: LedgerRecord[]): PayoutLimiter {
+  // One payout per deposit: an "already-settled" line can follow this instance's own "settled".
+  const counted = new Set<string>();
   let window: { at: number; amount: bigint }[] = history
-    // "SettledDespiteError": a settle that reported an error but did land - a payout like any other.
-    .filter((r) => (r.status === "settled" || (r.status === "already-settled" && r.error === "SettledDespiteError")) && r.sourceChain !== "xode")
+    // "already-settled": paid out all the same - by a settle that reported an error but landed, or
+    // by another attester's instance (counted from when this one noticed).
+    .filter((r) => (r.status === "settled" || r.status === "already-settled") && r.sourceChain !== "xode")
+    .filter((r) => {
+      const id = r.depositId?.toLowerCase();
+      if (id === undefined) return true;
+      if (r.status === "already-settled" && counted.has(id)) return false;
+      counted.add(id);
+      return true;
+    })
     .map((r) => ({ at: Date.parse(r.time), amount: BigInt(r.usdtAmount) }))
     .filter((e) => Number.isFinite(e.at));
 
@@ -56,6 +70,9 @@ export function makePayoutLimiter(limits: PayoutLimitsConfig, history: LedgerRec
       return () => {
         window = window.filter((e) => e !== entry);
       };
+    },
+    note(usdtAmount) {
+      window.push({ at: Date.now(), amount: usdtAmount });
     },
     usedInWindow,
   };

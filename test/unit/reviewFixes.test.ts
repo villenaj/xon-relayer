@@ -144,17 +144,21 @@ test("the API starts over when the ledger is rotated or replaced", () => {
 
 // --- payout window history ------------------------------------------------------------------------
 
-test("the 24h window counts payouts that landed despite an error, after a restart too", () => {
+test("the 24h window counts every payout once - own, landed despite an error, or another attester's - after a restart too", () => {
   const now = new Date().toISOString();
   const history = [
     { time: now, status: "settled", sourceChain: "ethereum", usdtAmount: "10" },
     { time: now, status: "already-settled", error: "SettledDespiteError", sourceChain: "assethub", usdtAmount: "5" },
-    { time: now, status: "already-settled", error: "AlreadyExternallySettled", sourceChain: "ethereum", usdtAmount: "100" }, // someone else's payout
+    { time: now, status: "already-settled", error: "SettledElsewhere", sourceChain: "ethereum", usdtAmount: "100", depositId: "0xB1" }, // another attester's payout
+    { time: now, status: "settled", sourceChain: "ethereum", usdtAmount: "7", depositId: "0xA1" },
+    { time: now, status: "already-settled", error: "AlreadyExternallySettled", sourceChain: "ethereum", usdtAmount: "7", depositId: "0xa1" }, // the same payout again
     { time: now, status: "settled", sourceChain: "xode", usdtAmount: "1000" }, // not an external payout
   ] as LedgerRecord[];
-  const limiter = makePayoutLimiter({ maxPerDeposit: null, maxPer24h: 20n }, history);
-  assert.equal(limiter.usedInWindow(), 15n);
-  assert.equal(limiter.reserve(6n), null);
+  const limiter = makePayoutLimiter({ maxPerDeposit: null, maxPer24h: 130n }, history);
+  assert.equal(limiter.usedInWindow(), 122n);
+  assert.equal(limiter.reserve(9n), null);
+  limiter.note(8n); // another instance's payout, seen while running
+  assert.equal(limiter.usedInWindow(), 130n);
 });
 
 // --- the rate keeper key ---------------------------------------------------------------------------

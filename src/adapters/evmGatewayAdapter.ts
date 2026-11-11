@@ -18,9 +18,12 @@ import { diagnoseSwapFailure } from "../xodeDex.js";
 import { connectCrossChecker } from "./crossCheck.js";
 import { runDepositScanner, type Deposit, type Gate, type ParsedDeposit } from "./depositScanner.js";
 import type { AdapterContext } from "./types.js";
+import { createRefundAttester } from "./attestedRefund.js";
+import { readLedger } from "../ledger.js";
+import { awaitingRefund } from "../tools/refundTargets.js";
 import GATEWAY_ABI from "../abi/EthUsdtGateway.json" with { type: "json" };
 
-export const DEPOSITED_TOPIC = ethers.id("Deposited(address,address,uint256,uint256)");
+export const DEPOSITED_TOPIC = ethers.id("Deposited(address,address,uint256,uint256,uint256)");
 export const SWAP_DEPOSITED_TOPIC = ethers.id("SwapDeposited(address,address,uint256,uint256,uint256)");
 /// Both deposit events: the relayer numbers a tx's deposits across the two, in log order.
 export const GATEWAY_DEPOSIT_TOPICS = [DEPOSITED_TOPIC, SWAP_DEPOSITED_TOPIC];
@@ -46,6 +49,21 @@ export async function runEvmGatewayAdapter(options: EvmGatewayAdapterOptions): P
   const chainId = await verifyEndpoint(provider, { label, expectedChainId: options.expectedChainId, contracts: { UsdtGateway: options.gatewayAddress } });
   const gateway = new ethers.Contract(options.gatewayAddress, GATEWAY_ABI, provider);
   const gatewayAddress = await gateway.getAddress();
+  // The vending contract says which chain and gateway "${sourceChain}" deposits come from. An RPC
+  // on another network, or another contract's address, must never get a deposit attested.
+  const registered = await settlement.registeredSource(sourceChain);
+  if (!registered) {
+    throw new Error(`[${label}] XonVendingMachine has no source registered for "${sourceChain}" - the owner has to register this chain and gateway (setSource) before its deposits can be paid.`);
+  }
+  if (registered.chainId !== chainId || ethers.getAddress(registered.gateway) !== ethers.getAddress(gatewayAddress)) {
+    throw new Error(`[${label}] XonVendingMachine expects "${sourceChain}" deposits from gateway ${registered.gateway} on chain ${registered.chainId}, but this adapter is configured for ${gatewayAddress} on chain ${chainId} - wrong RPC or gateway address.`);
+  }
+  if (sourceChain === "assethub" && typeof options.confirmations === "number") {
+    // Seen on pallet-revive's eth-rpc: eth_getLogs returns a block's logs at the head, then not
+    // again until the block is final (about 30s) - and the head itself is reorged routinely. A
+    // scan a few blocks behind the head silently misses deposits.
+    console.warn(`[${label}] ASSETHUB_CONFIRMATIONS=${options.confirmations}: a block count is unsafe on AssetHub - its eth-rpc can omit the logs of blocks that aren't final yet, so deposits would be missed. Use "finalized".`);
+  }
   // Decided once, here: a per-deposit "can't tell" must never read as "not refunded".
   const recordsDeposits = await gatewayRecordsDeposits(gateway);
   if (!recordsDeposits) console.warn(`[${label}] The gateway predates deposit records - deposits refunded on it can't be detected; cancel them on Xode before refunding.`);
@@ -85,8 +103,23 @@ export async function runEvmGatewayAdapter(options: EvmGatewayAdapterOptions): P
     return { action: "settle", release };
   }
 
+  // Refunds by attester quorum, for deposits this instance gives up on - and, after a restart,
+  // the ones the ledger says it gave up on before.
+  const refunds = (await settlement.supportsAttestedCancel())
+    ? createRefundAttester({ label, settlement, gateway, alert: (m) => alerts.send(m) })
+    : null;
+  if (refunds && options.config.ledgerFile) {
+    for (const r of awaitingRefund(readLedger(options.config.ledgerFile))) {
+      if (r.sourceChain !== sourceChain || r.gatewayNonce === undefined || !r.depositor) continue;
+      refunds.add({ depositId: r.depositId, sourceTxHash: r.sourceTxHash, usdtAmount: BigInt(r.usdtAmount), gatewayNonce: BigInt(r.gatewayNonce), depositor: r.depositor }, r.error ?? null);
+    }
+    if (refunds.pending() > 0) console.log(`[${label}] ${refunds.pending()} skipped deposit(s) from the ledger to check for a refund.`);
+  }
+
   await runDepositScanner(options, {
     label,
+    onSkipped: (d, error) => refunds?.add(d, error),
+    afterTick: async () => refunds?.tick(),
     description: `UsdtGateway (${gatewayAddress}) deposits on ${rpcUrl}`,
     provider,
     logAddress: gatewayAddress,
@@ -101,6 +134,8 @@ export async function runEvmGatewayAdapter(options: EvmGatewayAdapterOptions): P
     baseDepositId: (txHash) => externalDepositId(sourceChain, txHash),
     // A deposit the gateway owner refunded must never be paid out as well: refund() clears its
     // record on the gateway, and nothing tells Xode. Treat it as done.
+    isPaidOut: (d) => settlement.isExternalSettled(d.depositId),
+    onPaidElsewhere: (d) => limiter.note(d.usdtAmount),
     isSettled: async (d) => {
       if (await settlement.isExternalSettled(d.depositId)) return true;
       if (await isRefundedOnGateway(gateway, d.gatewayNonce, recordsDeposits)) {
@@ -110,7 +145,7 @@ export async function runEvmGatewayAdapter(options: EvmGatewayAdapterOptions): P
       return false;
     },
     settle: (d) => d.minXonOut === undefined
-      ? settlement.settleExternal(d.buyer, d.usdtAmount, sourceChain, d.depositId, label)
+      ? settlement.settleExternal(d.buyer, d.usdtAmount, d.fixedMinXonOut ?? 1n, sourceChain, d.depositId, label)
       : settlement.settleExternalSwap(d.buyer, d.usdtAmount, d.minXonOut, sourceChain, d.depositId, label),
     gate,
     verify: crossCheck.count > 0 ? (_d, log) => crossCheck.check(log) : undefined,
@@ -127,7 +162,8 @@ export async function runEvmGatewayAdapter(options: EvmGatewayAdapterOptions): P
   });
 }
 
-/// A gateway deposit log as the scanner's ParsedDeposit - `minXonOut` set for `SwapDeposited`.
+/// A gateway deposit log as the scanner's ParsedDeposit - `minXonOut` set for `SwapDeposited`,
+/// `fixedMinXonOut` for a fixed-rate `Deposited`.
 export function parseGatewayDeposit(iface: ethers.Interface, log: ethers.Log, sourceChain: string): ParsedDeposit | null {
   if (log.topics[0] !== DEPOSITED_TOPIC && log.topics[0] !== SWAP_DEPOSITED_TOPIC) return null;
   const parsed = iface.parseLog(log);
@@ -139,7 +175,8 @@ export function parseGatewayDeposit(iface: ethers.Interface, log: ethers.Log, so
     sourceTxHash: log.transactionHash,
     sourceBlock: log.blockNumber,
     gatewayNonce: parsed.args.depositNonce as bigint,
-    ...(parsed.name === "SwapDeposited" ? { minXonOut: parsed.args.minXonOut as bigint } : {}),
+    depositor: parsed.args.depositor as string,
+    ...(parsed.name === "SwapDeposited" ? { minXonOut: parsed.args.minXonOut as bigint } : { fixedMinXonOut: parsed.args.minXonOut as bigint }),
   };
 }
 

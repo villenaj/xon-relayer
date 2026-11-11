@@ -256,12 +256,20 @@ export async function createSettlementClient({
     async isExternalSettled(depositId: string): Promise<boolean> {
       return vending.externalSettledDeposits(depositId);
     },
-    async settleExternal(buyer: string, usdtAmount: bigint, sourceChain: string, depositId: string, label: string): Promise<TransactionReceipt> {
-      console.log(`[${label}] New deposit: ${buyer} paid ${usdtAmount.toString()} USDT on ${sourceChain} (id ${depositId}). Settling...`);
-      const params: string = await vending.purchaseParams(buyer, usdtAmount, sourceChain);
+    /// The chain id and gateway the vending contract has registered for a source label - what an
+    /// adapter's own RPC and gateway address must match. Null if the label isn't registered.
+    async registeredSource(sourceChain: string): Promise<{ chainId: bigint; gateway: string } | null> {
+      const [chainId, gateway]: [bigint, string] = await vending.source(sourceChain);
+      return gateway === ethers.ZeroAddress ? null : { chainId, gateway };
+    },
+    /// `minXonOut` is the depositor's own minimum, from the deposit's event: if the fixed rate now
+    /// gives less, the settle reverts `BelowMinimum` and the deposit is refunded instead.
+    async settleExternal(buyer: string, usdtAmount: bigint, minXonOut: bigint, sourceChain: string, depositId: string, label: string): Promise<TransactionReceipt> {
+      console.log(`[${label}] New deposit: ${buyer} paid ${usdtAmount.toString()} USDT on ${sourceChain}, minimum ${ethers.formatEther(minXonOut)} XON (id ${depositId}). Settling...`);
+      const params: string = await vending.purchaseParams(buyer, usdtAmount, minXonOut, sourceChain);
       const receipt = await attestThenExecute(label, depositId, params,
-        () => vending.attestExternalPurchase(buyer, usdtAmount, sourceChain, depositId),
-        () => vending.settleExternalPurchase(buyer, usdtAmount, sourceChain, depositId), false);
+        () => vending.attestExternalPurchase(buyer, usdtAmount, minXonOut, sourceChain, depositId),
+        () => vending.settleExternalPurchase(buyer, usdtAmount, minXonOut, sourceChain, depositId), false);
       console.log(`[${label}] Settled ${depositId} in block ${receipt.blockNumber} (settle tx ${receipt.hash}).`);
       return receipt;
     },
@@ -276,6 +284,30 @@ export async function createSettlementClient({
       console.log(`[${label}] Settled ${depositId} at market price in block ${receipt.blockNumber} (settle tx ${receipt.hash}).`);
       return receipt;
     },
+    // Refunds authorised by the attesters (see adapters/attestedRefund.ts): a deposit that can't be
+    // paid is cancelled here by a quorum of attesters, who then each publish a signature the
+    // gateway accepts for its refund - no owner transaction on either chain.
+    /// Whether this vending contract has attester cancels (older deployments don't).
+    supportsAttestedCancel: () => hasOptionalView(() => vending.hasVotedCancel(ethers.ZeroHash, wallet.address)),
+    async cancelState(depositId: string): Promise<{ paid: boolean; cancelled: boolean; chargeFee: boolean; voted: boolean }> {
+      const [paid, cancelled, chargeFee, voted]: boolean[] = await Promise.all([
+        vending.externalSettledDeposits(depositId), vending.externalCancelled(depositId),
+        vending.cancelChargesFee(depositId), vending.hasVotedCancel(depositId, wallet.address),
+      ]);
+      return { paid, cancelled, chargeFee, voted };
+    },
+    async voteCancel(depositId: string, chargeFee: boolean, label: string): Promise<void> {
+      const receipt = await sendAndConfirm(sender, label, () => vending.attestExternalCancel(depositId, chargeFee));
+      console.log(`[${label}] Voted to cancel ${depositId} (${chargeFee ? "refund less the fee" : "refund in full"}; tx ${receipt.hash}).`);
+    },
+    /// Signs the gateway's refund digest with the attester key and publishes the signature on Xode.
+    /// The contract only accepts it once the deposit is cancelled.
+    async publishRefundSignature(depositId: string, digest: string, label: string): Promise<void> {
+      const signature = await wallet.signMessage(ethers.getBytes(digest));
+      const receipt = await sendAndConfirm(sender, label, () => vending.publishRefundSignature(depositId, signature));
+      console.log(`[${label}] Published the refund signature for ${depositId} (tx ${receipt.hash}).`);
+    },
+    attesterAddress: wallet.address,
     /// USDT the vending contract holds for market-price payouts (raw units), or null if the
     /// deployed contract predates them.
     async usdtInventory(): Promise<bigint | null> {

@@ -170,6 +170,13 @@ export async function followTx(service: ApiService, networkName: string, txHash:
     for (const deposit of status.deposits) {
       if (deposit.state !== "settled") continue;
       let payout = paid.get(deposit.depositId);
+      if (!payout && deposit.xonAmount) {
+        // Paid over XCM: the status already read the payout from Xode - there's no vending
+        // contract event to look for.
+        payout = { settleTxHash: deposit.settleTxHash, xonAmount: deposit.xonAmount };
+        paid.set(deposit.depositId, payout);
+        stream.send("payout", { network: net.name, txHash: status.txHash, ...deposit, ...payout });
+      }
       if (!payout) {
         const found = await service.findPayout(deposit.depositId, net.gateway !== null, xodeStart);
         if (!found && !deposit.settleTxHash) continue; // flag's set but the event isn't visible yet - next poll

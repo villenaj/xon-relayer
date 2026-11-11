@@ -22,6 +22,8 @@
     "test:e2e": "tsx test/e2e.manual.ts",
     "test:multi-buyer": "tsx test/multiBuyer.manual.ts",
     "test:poison-pill": "tsx test/poisonPill.manual.ts",
+    "test:xcm": "tsx test/xcmRoute.manual.ts",
+    "test:live": "tsx test/relayerLive.manual.ts",
     "safe": "node dist/tools/safe.js"
   },
   "dependencies": {

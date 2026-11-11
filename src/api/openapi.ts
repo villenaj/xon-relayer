@@ -36,7 +36,7 @@ const beneficiary = { ...address, description: "Who receives the XON on Xode. De
 // Market-price purchases (AssetHub/Ethereum): give one of these to deposit with `depositForSwap`.
 const swapTerms = {
   minXonOut: { type: "string", example: "3.8", description: "Pay at the Xode DEX's market price: the least XON accepted, else the USDT is refunded. AssetHub/Ethereum only." },
-  slippageBps: { type: "integer", minimum: 1, maximum: 5000, example: 100, description: "Pay at market price with the minimum set from a fresh DEX quote less this many basis points (100 = 1%). Needs the API's XODE_SUBSTRATE_RPC; ignored if minXonOut is given." },
+  slippageBps: { type: "integer", minimum: 1, maximum: 1000, example: 100, description: "Pay at market price with the minimum set from a fresh DEX quote less this many basis points (100 = 1%). Needs the API's XODE_SUBSTRATE_RPC; ignored if minXonOut is given." },
 };
 
 export const openApiSpec = {
@@ -85,7 +85,7 @@ export const openApiSpec = {
         parameters: [
           { name: "amount", in: "query", required: true, schema: usdtInput },
           { name: "network", in: "query", required: false, schema: { ...networkName, default: "xode" } },
-          { name: "slippageBps", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 5000, default: 100 } },
+          { name: "slippageBps", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 1000, default: 100 } },
         ],
         responses: { 200: json(ref("Quote")), ...errors(400, 404, 422, 502) },
       },
@@ -125,7 +125,7 @@ export const openApiSpec = {
         operationId: "prepareBuy",
         tags: ["Transactions"],
         summary: "Every transaction a purchase needs, in order",
-        description: "Xode: one USDT `transfer` into the vending contract. AssetHub/Ethereum: `approve` (only if the allowance is too low; on Ethereum a non-zero allowance is reset to 0 first) then `deposit` - or `depositForSwap` with `minXonOut` / `slippageBps`, paid at the DEX's market price.",
+        description: "Xode: one USDT `transfer` into the vending contract. AssetHub/Ethereum: `approve` (only if the allowance is too low; on Ethereum a non-zero allowance is reset to 0 first) then `deposit` - or, with `minXonOut` / `slippageBps`, paid at the DEX's market price: on Ethereum (and AssetHub with `marketRoute` \"gateway\") `depositForSwap`; on AssetHub with `marketRoute` \"xcm\" a single `swap` step - AssetHub's XCM precompile `execute`, which sends the USDT to Xode and swaps it on arrival (no approval, no relayer). That call is dry-run on Xode and simulated on AssetHub first: 422 `SwapUnavailable` if Xode wouldn't swap it right now, `SwapRejected` if AssetHub would revert it (e.g. no DOT for the ~0.031 DOT delivery fee).",
         requestBody: prepareBody(["network", "from", "amount"], { beneficiary, ...swapTerms }),
         responses: { 200: json(ref("PreparedPurchase")), ...errors(400, 404, 422, 502) },
       },
@@ -233,6 +233,13 @@ export const openApiSpec = {
           usdtAddress: address,
           payTo: { ...address, description: "The contract USDT is paid into: the vending contract on Xode, the gateway elsewhere." },
           flow: { type: "string", enum: ["transfer", "approve-deposit"] },
+          marketRoute: { type: "string", nullable: true, enum: ["xcm", "gateway"], description: "How a market-price purchase is paid from here: one XCM precompile call swapped on Xode on arrival, or the gateway's depositForSwap. Null on Xode." },
+          xcm: {
+            type: "object",
+            nullable: true,
+            description: "For marketRoute \"xcm\": the XCM precompile, Xode's para id, the USDT fee Xode takes (kept if the swap fails) and the smallest purchase.",
+            properties: { precompile: address, paraId: { type: "integer", example: 3417 }, fee: ref("Amount"), minPurchase: ref("Amount") },
+          },
           confirmations: { oneOf: [{ type: "integer" }, { type: "string", enum: ["safe", "finalized"] }], description: "How settled a deposit's block must be before it's paid." },
         },
       },
@@ -271,12 +278,14 @@ export const openApiSpec = {
           network: networkName,
           usdtAmount: ref("Amount"),
           xonAmount: { ...ref("Amount"), description: "At the vending contract's fixed rate." },
+          minXonOut: { ...ref("Amount"), description: "Gateway networks: the minimum a fixed-rate deposit will carry - if the rate drops below it before the deposit settles, the deposit is refunded instead." },
+          rateToleranceBps: { type: "integer", description: "How far below `xonAmount` that minimum sits." },
           warnings: { type: "array", items: { type: "string" } },
           swap: {
             type: "object",
             nullable: true,
-            description: "At the Xode DEX's market price (depositForSwap). Null on Xode, or when the API can't quote the DEX.",
-            properties: { xonAmount: ref("Amount"), minXonOut: ref("Amount"), slippageBps: { type: "integer" }, warnings: { type: "array", items: { type: "string" } } },
+            description: "At the Xode DEX's market price. Null on Xode, when the API can't quote the DEX, or (route xcm) while Xode wouldn't swap an arriving purchase. Over XCM the quote is for the USDT left after Xode's fee.",
+            properties: { xonAmount: ref("Amount"), minXonOut: ref("Amount"), slippageBps: { type: "integer" }, refundFee: ref("Amount"), route: { type: "string", enum: ["xcm"], description: "Present for XCM-route quotes." }, warnings: { type: "array", items: { type: "string" } } },
           },
         },
       },
@@ -303,7 +312,7 @@ export const openApiSpec = {
       },
       TxStep: {
         type: "object",
-        properties: { kind: { type: "string", enum: ["approve", "deposit", "transfer"] }, description: { type: "string" }, tx: ref("UnsignedTx") },
+        properties: { kind: { type: "string", enum: ["approve", "deposit", "transfer", "swap"], description: "swap: AssetHub's XCM precompile `execute` - the whole market-price purchase." }, description: { type: "string" }, tx: ref("UnsignedTx") },
       },
       PreparedPurchase: {
         type: "object",
@@ -316,6 +325,13 @@ export const openApiSpec = {
           payout: { type: "string", enum: ["rate", "swap"], description: "Fixed rate (`deposit`/transfer) or market price (`depositForSwap`)." },
           xonAmount: { ...nullable("Amount"), description: "Fixed rate: what's paid. Market price: the DEX's current quote (null if it can't be quoted)." },
           minXonOut: { ...ref("Amount"), description: "Market price only: the least XON the deposit accepts." },
+          route: { type: "string", enum: ["xcm"], description: "Present for a purchase over XCM." },
+          refundFee: { ...ref("Amount"), description: "Market price: kept if the minimum can't be met. Over XCM, Xode's fee; the rest of the USDT is left with the beneficiary on Xode." },
+          xcm: {
+            type: "object",
+            description: "Over XCM only - what the `swap` call carries, to check before signing: the AccountId32 on Xode that's paid (the beneficiary's mapped account, else its 0xEE-padded fallback), the message topic (its id on Xode), Xode's para id, and the minimum in XON planck (12 decimals).",
+            properties: { beneficiaryAccount: { type: "string" }, topic: { type: "string" }, paraId: { type: "integer" }, minXonPlanck: { type: "string" } },
+          },
           warnings: { type: "array", items: { type: "string" } },
           steps: { type: "array", items: ref("TxStep") },
         },
@@ -362,7 +378,7 @@ export const openApiSpec = {
       DepositState: {
         type: "string",
         enum: ["awaiting-confirmations", "settling", "settled", "held", "skipped", "refunded"],
-        description: "awaiting-confirmations: mined, not yet past the chain's confirmation setting. settling: waiting for the relayer. held: over a payout limit, waiting for an operator. skipped: can never be paid, the USDT is owed back. refunded: it was returned.",
+        description: "awaiting-confirmations: mined, not yet past the chain's confirmation setting. settling: waiting for the relayer (over XCM: for Xode to process the message). held: over a payout limit, waiting for an operator. skipped: can never be paid, the USDT is owed back. refunded: it was returned (over XCM: the swap failed and the USDT, less Xode's fee, was left with the beneficiary on Xode - `error` says so).",
       },
       TxStatus: {
         type: "object",

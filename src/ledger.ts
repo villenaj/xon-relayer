@@ -39,7 +39,7 @@ export interface LedgerEntry {
 }
 
 /// An entry as stored on disk: amounts as decimal strings, plus the time it was written.
-export type LedgerRecord = Omit<LedgerEntry, "usdtAmount" | "minXonOut"> & { time: string; usdtAmount: string; minXonOut?: string; gatewayNonce?: string };
+export type LedgerRecord = Omit<LedgerEntry, "usdtAmount" | "minXonOut"> & { time: string; usdtAmount: string; minXonOut?: string; gatewayNonce?: string; depositor?: string; fixedMinXonOut?: string };
 
 export interface Ledger {
   record(entry: LedgerEntry): void;

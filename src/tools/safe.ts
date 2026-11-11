@@ -7,6 +7,8 @@
 //        cancels                       (xode) cancel every deposit awaiting a refund, so it can never be paid -
 //                                      a refund is only proposed, signed or executed once its deposit is cancelled
 //        refunds                       every deposit awaiting a refund on that chain (batched)
+//        releases                      (gateways) mark deposits paid on Xode as no longer owed, so their
+//                                      USDT can be withdrawn - a gateway never lets unpaid deposits leave
 //        refund <source tx> [--index n]
 //        withdraw <amount> [--asset xon|usdt]   to the treasury (the only place it can go)
 //        pause | unpause               (ops)          guardian-pause | cancel-treasury   (guardian)
@@ -36,7 +38,8 @@ import {
   bundle, describeCall, packSignatures, reviewCalls, PROPOSAL_FORMAT, safeTx, safeTxHash, serializeTx, signerOf, typedData,
   verifyProposal, type Call, type Proposal,
 } from "../safe/safeTx.js";
-import { option, runTool } from "./common.js";
+import { depositIdAt, externalDepositId } from "../settlement.js";
+import { GATEWAY_DEPOSIT_TOPICS, option, runTool } from "./common.js";
 import { awaitingRefund, gatewayDeposit, refundTarget, xodeStatus } from "./refundTargets.js";
 import GATEWAY_ABI from "../abi/EthUsdtGateway.json" with { type: "json" };
 import VENDING_ABI from "../abi/XonVendingMachine.json" with { type: "json" };
@@ -98,6 +101,35 @@ async function context(chain: ChainName, role: string) {
   return { safes, safeAddress: ethers.getAddress(safeAddress), target, provider, safe, names, multiSend: safes.multiSendCallOnly ?? null };
 }
 
+/// Gateway deposits the ledger has as paid, confirmed paid on Xode, and still recorded (so still
+/// counted as owed) on the gateway. Depositor and amount come from the deposit's own event.
+async function releasable(chain: ChainName, gatewayAddress: string): Promise<{ nonce: bigint; depositor: string; usdtAmount: bigint }[]> {
+  const provider = makeProvider(chainTarget(chain).rpc, config.rpcTimeoutMs);
+  const gateway = new ethers.Contract(gatewayAddress, GATEWAY_ABI, provider);
+  const seen = new Set<string>();
+  const out: { nonce: bigint; depositor: string; usdtAmount: bigint }[] = [];
+  for (const r of readLedger(config.ledgerFile)) {
+    if (r.sourceChain !== chain || (r.status !== "settled" && r.status !== "already-settled") || seen.has(r.depositId)) continue;
+    seen.add(r.depositId);
+    try {
+      const receipt = await provider.getTransactionReceipt(r.sourceTxHash);
+      const log = receipt?.logs
+        .filter((l) => l.address.toLowerCase() === gatewayAddress.toLowerCase() && GATEWAY_DEPOSIT_TOPICS.includes(l.topics[0]))
+        .sort((a, b) => a.index - b.index)[r.depositIndex ?? 0];
+      if (!log) throw new Error("its deposit event wasn't found");
+      const event = gateway.interface.parseLog(log)!;
+      const nonce: bigint = event.args.depositNonce;
+      if ((await gateway.depositRecords(nonce)) === ethers.ZeroHash) continue; // released or refunded already
+      const depositId = depositIdAt(externalDepositId(chain, r.sourceTxHash), r.depositIndex ?? 0);
+      if (!(await xodeStatus(depositId)).paid) { console.warn(`Leaving out ${r.sourceTxHash}: the ledger has it paid, but Xode doesn't.`); continue; }
+      out.push({ nonce, depositor: event.args.depositor, usdtAmount: event.args.usdtAmount });
+    } catch (err) {
+      console.warn(`Leaving out ${r.sourceTxHash}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+  return out;
+}
+
 // --- propose ---------------------------------------------------------------------------------------
 
 async function proposeCalls(action: string, args: string[], chain: ChainName, target: ReturnType<typeof chainTarget>): Promise<{ calls: Call[]; description: string }> {
@@ -149,6 +181,18 @@ async function proposeCalls(action: string, args: string[], chain: ChainName, ta
       }
       if (calls.length === 0) throw new Error(`No deposits on ${chain} that can be refunded through its gateway.`);
       return { calls, description: `Refund ${calls.length} deposit(s) on ${chain} to their depositors` };
+    }
+    case "releases": {
+      // Deposits paid on Xode are no longer owed: releasing them is what makes their USDT withdrawable.
+      if (target.kind !== "gateway") throw new Error("Deposits are released on the gateways (assethub / ethereum).");
+      const paidOut = await releasable(chain, target.contract);
+      if (paidOut.length === 0) throw new Error(`No deposits on ${chain} paid on Xode that still need releasing.`);
+      const batch = paidOut.slice(0, 100);
+      const total = batch.reduce((sum, d) => sum + d.usdtAmount, 0n);
+      return {
+        calls: [call("release", [batch.map((d) => d.nonce), batch.map((d) => d.depositor), batch.map((d) => d.usdtAmount)])],
+        description: `Release ${batch.length} deposit(s) on ${chain} paid on Xode (${ethers.formatUnits(total, USDT_DECIMALS)} USDT becomes withdrawable)${paidOut.length > batch.length ? ` - ${paidOut.length - batch.length} more to release after this` : ""}`,
+      };
     }
     case "withdraw": {
       const amount = args[0];

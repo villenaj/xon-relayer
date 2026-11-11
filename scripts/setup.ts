@@ -209,8 +209,30 @@ async function requireOwner(name: string, contract: ethers.Contract, owner: stri
   if (onChain !== owner) throw new Error(`[${name}] ${await contract.getAddress()} is owned by ${onChain}, not the contract owner ${owner}.`);
 }
 
-/// The gateway's minimum deposit and refund fee, while the deployer still owns it.
-async function gatewayRules(name: string, gateway: ethers.Contract): Promise<void> {
+/// Registers the gateway as the source of `name` deposits on the vending contract (chain id +
+/// address), which every attester's relayer checks its own RPC and gateway against.
+async function registerSource(name: string, vending: ethers.Contract, gateway: ethers.Contract): Promise<void> {
+  const { chainId } = await (gateway.runner as ethers.Signer).provider!.getNetwork();
+  const address = await gateway.getAddress();
+  const [registeredChain, registeredGateway]: [bigint, string] = await vending.source(name);
+  if (registeredChain === chainId && registeredGateway === address) return;
+  await (await vending.setSource(name, chainId, address)).wait();
+  console.log(`[xode] source "${name}" registered: gateway ${address} on chain ${chainId}`);
+}
+
+/// The gateway's minimum deposit, refund fee and refund attesters, while the deployer still owns it.
+async function gatewayRules(name: string, gateway: ethers.Contract, attesters: string[], threshold: bigint): Promise<void> {
+  // The same attesters that vote on Xode sign refunds here, with the same threshold.
+  for (const a of attesters) {
+    if (!(await gateway.isAttester(a))) {
+      await (await gateway.addAttester(a)).wait();
+      console.log(`[${name}] refund attester ${a} added`);
+    }
+  }
+  if ((await gateway.attestationThreshold()) !== threshold) {
+    await (await gateway.setAttestationThreshold(threshold)).wait();
+    console.log(`[${name}] refunds need ${threshold} of ${attesters.length} attesters' signatures (or the owner)`);
+  }
   if ((await gateway.minDeposit()) !== MIN_DEPOSIT) {
     await (await gateway.setMinDeposit(MIN_DEPOSIT)).wait();
     console.log(`[${name}] minimum deposit ${ethers.formatUnits(MIN_DEPOSIT, 6)} USDT`);
@@ -332,7 +354,8 @@ async function main(): Promise<void> {
     const gateway = await deployOrReuse("assethub: EthUsdtGateway", gatewayArtifact, ahOwner,
       process.env.ASSETHUB_GATEWAY_ADDRESS, [precompileAddr(ASSET_ID), owner.address, roleOf("ASSETHUB_TREASURY", owner.address), roleOf("ASSETHUB_GUARDIAN", owner.address)]);
     await requireOwner("assethub", gateway.contract, owner.address);
-    await gatewayRules("assethub", gateway.contract);
+    await gatewayRules("assethub", gateway.contract, [relayer.address, ...extraAttesters.map((a) => a.address)], ATTESTATION_THRESHOLD);
+    await registerSource("assethub", vending.contract, gateway.contract);
     Object.assign(out, { ASSETHUB_EVM_RPC, ASSETHUB_GATEWAY_ADDRESS: gateway.address });
     if (gateway.deployBlock !== undefined) out.ASSETHUB_START_BLOCK = String(gateway.deployBlock);
   }
@@ -367,7 +390,8 @@ async function main(): Promise<void> {
     const gateway = await deployOrReuse("ethereum: EthUsdtGateway", gatewayArtifact, ethOwner,
       process.env.ETH_GATEWAY_ADDRESS, [ethUsdt, owner.address, roleOf("ETHEREUM_TREASURY", owner.address), roleOf("ETHEREUM_GUARDIAN", owner.address)]);
     await requireOwner("ethereum", gateway.contract, owner.address);
-    await gatewayRules("ethereum", gateway.contract);
+    await gatewayRules("ethereum", gateway.contract, [relayer.address, ...extraAttesters.map((a) => a.address)], ATTESTATION_THRESHOLD);
+    await registerSource("ethereum", vending.contract, gateway.contract);
     Object.assign(out, { ETHEREUM_RPC, ETH_GATEWAY_ADDRESS: gateway.address });
     if (gateway.deployBlock !== undefined) out.ETHEREUM_START_BLOCK = String(gateway.deployBlock);
   }

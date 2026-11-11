@@ -1,6 +1,7 @@
 // The chains the front-end API serves, connected and checked once at startup: Xode itself (where
 // a purchase is a plain USDT transfer into XonVendingMachine) plus every external chain with an
-// RPC and gateway configured (where it's approve + UsdtGateway.deposit).
+// RPC and gateway configured (where it's approve + UsdtGateway.deposit, or - market price from
+// AssetHub - one call to AssetHub's XCM precompile).
 
 import { ethers, type JsonRpcProvider } from "ethers";
 import { makeProvider, verifyEndpoint, type Confirmations } from "../chain.js";
@@ -27,6 +28,9 @@ export interface Network {
   /// Real USDT on Ethereum reverts an approve from one non-zero allowance to another, so a
   /// top-up has to go through 0 first.
   approveResetsToZero: boolean;
+  /// Set on AssetHub when its market-price purchases go over XCM (ASSETHUB_MARKET_ROUTE=xcm): one
+  /// call to the XCM precompile, swapped on Xode on arrival (see xcmSwap.ts). Null elsewhere.
+  xcmSwap: { paraId: number } | null;
 }
 
 export interface Networks {
@@ -51,6 +55,7 @@ export async function connectNetworks(config: Config): Promise<Networks> {
     payTo: await vending.getAddress(),
     gateway: null,
     approveResetsToZero: false,
+    xcmSwap: null,
   };
 
   const byName = new Map<NetworkName, Network>([["xode", xode]]);
@@ -70,6 +75,7 @@ export async function connectNetworks(config: Config): Promise<Networks> {
       payTo: await gateway.getAddress(),
       gateway,
       approveResetsToZero: chain.name === "ethereum",
+      xcmSwap: chain.name === "assethub" && config.assetHubMarketRoute === "xcm" ? { paraId: config.xodeParaId } : null,
     });
   }
   return { xode, vending, byName };

@@ -13,7 +13,9 @@ import { GATEWAY_DEPOSIT_TOPICS, TRANSFER_TOPIC } from "../tools/common.js";
 import type { XodeDex } from "../xodeDex.js";
 import { ApiError } from "./http.js";
 import type { Network, NetworkName, Networks } from "./networks.js";
-import { approveSteps, depositStep, parseAddress, parseSlippageBps, parseUsdt, parseXon, purchaseSteps, type TxStep } from "./transactions.js";
+import { approveSteps, depositStep, parseAddress, parseSlippageBps, parseUsdt, parseXon, purchaseSteps, swapInCall, swapStep, type TxStep } from "./transactions.js";
+import { accountToAddress, PLANCK_TO_WEI, XCM_PRECOMPILE, XCM_SWAP_FEE, XCM_SWAP_MIN_USDT } from "../xcmSwap.js";
+import { makeXcmHistory, makeXcmRoute } from "./xcmRoute.js";
 
 export const SETTLED_TOPIC = ethers.id("Settled(address,bytes32,uint256,uint256)");
 export const EXTERNAL_SETTLED_TOPIC = ethers.id("ExternalSettled(address,string,bytes32,uint256,uint256)");
@@ -190,6 +192,8 @@ export type ApiService = ReturnType<typeof makeApiService>;
 export function makeApiService(config: Config, networks: Networks, dex: XodeDex | null = null) {
   const { xode, vending } = networks;
   const ledger = makeLedgerView(config.ledgerFile);
+  // Market-price purchases from AssetHub over XCM (net.xcmSwap set) - see xcmRoute.ts.
+  const xcm = makeXcmRoute(dex, makeXcmHistory(config.xcmPurchasesFile));
 
   function network(name: string): Network {
     const found = networks.byName.get(name as NetworkName);
@@ -242,7 +246,7 @@ export function makeApiService(config: Config, networks: Networks, dex: XodeDex 
     if (!beneficiary) return null;
     try {
       const available: bigint = await vending.addressAvailable(beneficiary);
-      if (amount > available) return `This is over what ${beneficiary} can still receive today (${ethers.formatUnits(available, USDT_DECIMALS)} USDT's worth) - the deposit would be held until an operator reviews it.`;
+      if (amount > available) return `This is over what ${beneficiary} can still receive today (${ethers.formatUnits(available, USDT_DECIMALS)} USDT's worth) - the deposit would wait and be paid automatically as that limit refills (up to a day).`;
     } catch {
       // A vending contract without per-address limits.
     }
@@ -265,7 +269,7 @@ export function makeApiService(config: Config, networks: Networks, dex: XodeDex 
       // A vending contract without the fixed-rate pause.
     }
     if (fixedPaused) {
-      warnings.push(`Fixed-rate payouts are paused right now (the fixed rate is too far from the DEX price) - this would be held until an operator reviews it.${net.gateway ? " Pay at market price instead (slippageBps / minXonOut)." : ""}`);
+      warnings.push(`Fixed-rate payouts are paused right now (the fixed rate is too far from the DEX price) - this would wait and be paid automatically once they resume.${net.gateway ? " Pay at market price instead (slippageBps / minXonOut)." : ""}`);
     }
     if (reserve < xon) warnings.push("The vending contract's XON reserve is currently below this payout - it will be paid once the reserve is topped up.");
     warnings.push(...await limitWarnings(net, amount, limits));
@@ -305,7 +309,8 @@ export function makeApiService(config: Config, networks: Networks, dex: XodeDex 
   async function payoutTerms(net: Network, amount: bigint, input: { minXonOut?: unknown; slippageBps?: unknown }): Promise<{ minXonOut: bigint; quote: bigint | null } | null> {
     if (input.minXonOut === undefined && input.slippageBps === undefined) return null;
     if (!net.gateway) throw new ApiError(400, "SwapNotSupported", "Market-price purchases are for AssetHub/Ethereum deposits - on Xode, swap on the DEX directly.");
-    const quote = dex ? await dex.quoteUsdtToXon(amount) : null;
+    // Over XCM, Xode takes its fee from the USDT before the swap, so quote what's left.
+    const quote = net.xcmSwap ? await xcm.quote(amount) : dex ? await dex.quoteUsdtToXon(amount) : null;
     if (input.minXonOut !== undefined) return { minXonOut: parseXon(input.minXonOut, "minXonOut"), quote };
     const bps = parseSlippageBps(input.slippageBps);
     if (!dex) throw new ApiError(503, "SwapQuotesUnavailable", "This API can't quote the DEX (no XODE_SUBSTRATE_RPC) - pass minXonOut instead of slippageBps.");
@@ -329,13 +334,40 @@ export function makeApiService(config: Config, networks: Networks, dex: XodeDex 
     return warnings;
   }
 
+  /// The least XON a fixed-rate gateway deposit accepts: what the rate gives now, less the
+  /// tolerance. The payout is worked out when the deposit settles, minutes later; if the rate has
+  /// dropped by more than that meanwhile, the deposit is refunded instead of paid less.
+  function fixedMinimum(xon: bigint): bigint {
+    const min = (xon * BigInt(10_000 - config.fixedRateToleranceBps)) / 10_000n;
+    return min > 0n ? min : 1n;
+  }
+
   /// What a prepared purchase will pay: `payout` "rate" (fixed) or "swap" (market price, with the
   /// minimum and the DEX's current quote), and warnings for either.
   async function payoutSummary(net: Network, amount: bigint, terms: Awaited<ReturnType<typeof payoutTerms>>, beneficiary?: string) {
+    if (terms && net.xcmSwap) {
+      // Over XCM nothing goes through the vending contract, so none of its limits apply.
+      xcm.checkLimits(amount, terms.minXonOut);
+      return {
+        payout: "swap",
+        route: "xcm",
+        xonAmount: terms.quote === null ? null : nativeAmount(terms.quote),
+        minXonOut: nativeAmount(terms.minXonOut),
+        // Kept by Xode if the minimum can't be met; the rest stays with the beneficiary on Xode.
+        refundFee: usdtAmount(XCM_SWAP_FEE),
+        warnings: xcm.warnings(terms.minXonOut, terms.quote),
+      };
+    }
     const perAddress = await addressWarning(beneficiary, amount);
     if (!terms) {
       const { xon, warnings } = await purchaseChecks(net, amount);
-      return { payout: "rate", xonAmount: nativeAmount(xon), warnings: perAddress ? [...warnings, perAddress] : warnings };
+      return {
+        payout: "rate",
+        xonAmount: nativeAmount(xon),
+        // Gateway deposits carry the buyer's minimum: paid at least this, or refunded.
+        ...(net.gateway ? { minXonOut: nativeAmount(fixedMinimum(xon)), rateToleranceBps: config.fixedRateToleranceBps } : {}),
+        warnings: perAddress ? [...warnings, perAddress] : warnings,
+      };
     }
     const warnings = await swapChecks(net, amount, terms.minXonOut, terms.quote);
     const { refundFee } = await gatewayRules(net);
@@ -364,8 +396,47 @@ export function makeApiService(config: Config, networks: Networks, dex: XodeDex 
     return { network: net.name, chainId: net.chainId, from, usdtAmount: usdtAmount(amount), ...extra, steps };
   }
 
+  /// The purchase in a mined XCM precompile call: the one deposit it makes, and what Xode did with
+  /// it. A precompile call that isn't the purchase program (someone else's XCM) has none.
+  async function xcmDeposits(net: Network, receipt: TransactionReceipt, confirmed: boolean): Promise<DepositInfo[]> {
+    const tx = await net.provider.getTransaction(receipt.hash);
+    const swap = tx ? swapInCall(tx.data) : null;
+    if (!swap || swap.params.paraId !== net.xcmSwap?.paraId) return [];
+    const { params } = swap;
+    const beneficiary = accountToAddress(params.beneficiaryAccount);
+    const base = { index: 0, depositId: params.topic, beneficiary, usdtAmount: usdtAmount(params.usdtAmount), settleTxHash: null, xonAmount: null, error: null };
+    if (!confirmed) return [{ ...base, state: "awaiting-confirmations" }];
+    const block = await net.provider.getBlock(receipt.blockNumber);
+    if (!block) return [{ ...base, state: "settling" }];
+    const outcome = await xcm.outcome(receipt.hash, params, block.timestamp * 1000);
+    if (!outcome) return [{ ...base, state: "settling" }];
+    const failure = outcome.error ? ` (${outcome.error})` : "";
+    switch (outcome.kind) {
+      case "swapped":
+        return [{ ...base, state: "settled", xonAmount: nativeAmount(outcome.xonPlanck * PLANCK_TO_WEI) }];
+      case "returned":
+        return [{ ...base, state: "refunded", error: `The swap didn't go through on Xode${failure}, so ${ethers.formatUnits(outcome.usdtAmount, USDT_DECIMALS)} USDT (the deposit less Xode's fee) was left with ${beneficiary} on Xode instead of XON.` }];
+      case "lost":
+        return [{ ...base, state: "skipped", error: outcome.trapped
+          ? `Neither XON nor USDT reached ${beneficiary} on Xode${failure} - the USDT is in Xode's asset trap (block ${outcome.blockHash}). Contact support with this transaction hash.`
+          : `Xode processed this purchase's message${failure}, but neither XON nor USDT reached ${beneficiary} and what happened to the USDT couldn't be read (block ${outcome.blockHash}). Contact support with this transaction hash.` }];
+    }
+  }
+
+  /// The fixed-rate minimum a summary carries (gateway deposits at the fixed rate only).
+  function fixedMinimumOf(summary: { payout: string; minXonOut?: { raw: bigint | string } }): bigint | undefined {
+    return summary.payout === "rate" && summary.minXonOut ? BigInt(summary.minXonOut.raw) : undefined;
+  }
+
   return {
     network,
+
+    /// Whether Xode would swap a purchase arriving over XCM right now; null if no network uses
+    /// that route. For the startup check - quotes ask `xcm.ready` themselves.
+    async xcmRouteReady(): Promise<boolean | null> {
+      const net = [...networks.byName.values()].find((n) => n.xcmSwap);
+      return net?.xcmSwap ? xcm.ready(net.xcmSwap.paraId) : null;
+    },
 
     async info() {
       const [rate, limits] = await Promise.all([vending.quote(ethers.parseUnits("1", USDT_DECIMALS)) as Promise<bigint>, externalLimits()]);
@@ -383,6 +454,10 @@ export function makeApiService(config: Config, networks: Networks, dex: XodeDex 
           // Where the USDT goes, and so what a purchase takes there.
           payTo: net.payTo,
           flow: net.gateway ? "approve-deposit" : "transfer",
+          // How a market-price purchase is paid from here: "xcm" (one call to the XCM precompile,
+          // swapped on Xode on arrival), "gateway" (depositForSwap), or null (Xode itself).
+          marketRoute: net.xcmSwap ? "xcm" : net.gateway ? "gateway" : null,
+          xcm: net.xcmSwap ? { precompile: XCM_PRECOMPILE, paraId: net.xcmSwap.paraId, fee: usdtAmount(XCM_SWAP_FEE), minPurchase: usdtAmount(XCM_SWAP_MIN_USDT) } : null,
           confirmations: net.confirmations,
         })),
         // Per gateway: the smallest deposit accepted, and the fee kept from a market-price refund
@@ -419,7 +494,18 @@ export function makeApiService(config: Config, networks: Networks, dex: XodeDex 
       const net = network(networkName ?? "xode");
       const { xon, warnings } = await purchaseChecks(net, amount);
       let swap = null;
-      if (net.gateway && dex) {
+      if (net.xcmSwap) {
+        // Offered only while Xode would actually swap an arriving purchase (see xcm.ready).
+        const quoted = (await xcm.ready(net.xcmSwap.paraId)) ? await xcm.quote(amount) : null;
+        if (quoted !== null) {
+          const slippageBps = slippageValue === null ? DEFAULT_SLIPPAGE_BPS : parseSlippageBps(slippageValue);
+          const minXonOut = (quoted * (10_000n - slippageBps)) / 10_000n;
+          const checks = amount < XCM_SWAP_MIN_USDT
+            ? [`Market-price purchases from AssetHub are at least ${ethers.formatUnits(XCM_SWAP_MIN_USDT, USDT_DECIMALS)} USDT.`]
+            : xcm.warnings(minXonOut, quoted);
+          swap = { xonAmount: nativeAmount(quoted), minXonOut: nativeAmount(minXonOut), slippageBps: Number(slippageBps), refundFee: usdtAmount(XCM_SWAP_FEE), route: "xcm", warnings: checks };
+        }
+      } else if (net.gateway && dex) {
         const slippageBps = slippageValue === null ? DEFAULT_SLIPPAGE_BPS : parseSlippageBps(slippageValue);
         const quoted = await dex.quoteUsdtToXon(amount);
         if (quoted !== null) {
@@ -433,7 +519,12 @@ export function makeApiService(config: Config, networks: Networks, dex: XodeDex 
           }
         }
       }
-      return { network: net.name, usdtAmount: usdtAmount(amount), xonAmount: nativeAmount(xon), warnings, swap };
+      return {
+        network: net.name, usdtAmount: usdtAmount(amount), xonAmount: nativeAmount(xon),
+        // Fixed rate through a gateway: the minimum the deposit will carry (paid at least this, or refunded).
+        ...(net.gateway ? { minXonOut: nativeAmount(fixedMinimum(xon)), rateToleranceBps: config.fixedRateToleranceBps } : {}),
+        warnings, swap,
+      };
     },
 
     async balances(addressValue: string, networkNames: string[] | null) {
@@ -479,12 +570,16 @@ export function makeApiService(config: Config, networks: Networks, dex: XodeDex 
       const beneficiary = body.beneficiary === undefined ? from : parseAddress(body.beneficiary, "beneficiary");
       const amount = parseUsdt(body.amount);
       const terms = await payoutTerms(net, amount, body);
-      const step = depositStep(net, from, amount, beneficiary, terms?.minXonOut);
+      if (terms && net.xcmSwap) {
+        throw new ApiError(400, "UseBuy", `Market-price purchases from ${net.name} are one XCM call, not a gateway deposit - prepare them with POST /api/tx/buy.`);
+      }
+      const summary = await payoutSummary(net, amount, terms, beneficiary);
+      const step = depositStep(net, from, amount, beneficiary, terms?.minXonOut, fixedMinimumOf(summary));
       const [allowance] = await Promise.all([allowanceOf(net, from), requireUsdtBalance(net, from, amount)]);
       if (allowance < amount) {
         throw new ApiError(422, "InsufficientAllowance", `The gateway may take ${ethers.formatUnits(allowance, USDT_DECIMALS)} USDT from ${from} - approve at least ${ethers.formatUnits(amount, USDT_DECIMALS)} first (POST /api/tx/approve).`);
       }
-      return prepared(net, from, amount, [step], { beneficiary, ...await payoutSummary(net, amount, terms, beneficiary) });
+      return prepared(net, from, amount, [step], { beneficiary, ...summary });
     },
 
     /// The whole purchase: every transaction needed, in order.
@@ -494,9 +589,21 @@ export function makeApiService(config: Config, networks: Networks, dex: XodeDex 
       const beneficiary = body.beneficiary === undefined ? from : parseAddress(body.beneficiary, "beneficiary");
       const amount = parseUsdt(body.amount);
       const terms = await payoutTerms(net, amount, body);
+      if (terms && net.xcmSwap) {
+        await requireUsdtBalance(net, from, amount);
+        const summary = await payoutSummary(net, amount, terms, beneficiary);
+        const { params, weight } = await xcm.prepare(net, from, beneficiary, amount, terms.minXonOut);
+        return prepared(net, from, amount, [swapStep(net, from, params, weight, beneficiary)], {
+          beneficiary,
+          ...summary,
+          // What the call carries, so the front-end can check it against what it asked for.
+          xcm: { beneficiaryAccount: params.beneficiaryAccount, topic: params.topic, paraId: params.paraId, minXonPlanck: params.minXonPlanck.toString() },
+        });
+      }
       const [allowance] = await Promise.all([allowanceOf(net, from), requireUsdtBalance(net, from, amount)]);
-      const steps = purchaseSteps(net, from, amount, beneficiary, allowance, terms?.minXonOut);
-      return prepared(net, from, amount, steps, { beneficiary, ...await payoutSummary(net, amount, terms, beneficiary) });
+      const summary = await payoutSummary(net, amount, terms, beneficiary);
+      const steps = purchaseSteps(net, from, amount, beneficiary, allowance, terms?.minXonOut, fixedMinimumOf(summary));
+      return prepared(net, from, amount, steps, { beneficiary, ...summary });
     },
 
     /// Relays a transaction the buyer's wallet signed but didn't send itself - only to this
@@ -512,8 +619,12 @@ export function makeApiService(config: Config, networks: Networks, dex: XodeDex 
       }
       if (!tx.signature) throw new ApiError(400, "InvalidTransaction", "signedTx isn't signed.");
       if (tx.chainId !== 0n && tx.chainId !== net.chainId) throw new ApiError(400, "WrongChain", `Transaction is for chain ${tx.chainId}, but ${net.name} is chain ${net.chainId}.`);
-      const allowedTo = [net.usdtAddress, net.payTo].map((a) => a.toLowerCase());
+      const allowedTo = [net.usdtAddress, net.payTo, ...(net.xcmSwap ? [XCM_PRECOMPILE] : [])].map((a) => a.toLowerCase());
       if (!tx.to || !allowedTo.includes(tx.to.toLowerCase())) throw new ApiError(400, "UnsupportedTransaction", "Only USDT and purchase transactions can be broadcast through this API.");
+      // The precompile runs any XCM; only the purchase program goes through here.
+      if (tx.to.toLowerCase() === XCM_PRECOMPILE.toLowerCase() && swapInCall(tx.data)?.params.paraId !== net.xcmSwap?.paraId) {
+        throw new ApiError(400, "UnsupportedTransaction", "Only USDT and purchase transactions can be broadcast through this API.");
+      }
       try {
         const sent = await net.provider.broadcastTransaction(body.signedTx);
         return { network: net.name, txHash: sent.hash };
@@ -547,6 +658,11 @@ export function makeApiService(config: Config, networks: Networks, dex: XodeDex 
         receipt: receiptJson(receipt),
       };
       if (receipt.status !== 1) return status;
+
+      if (net.xcmSwap && receipt.to?.toLowerCase() === XCM_PRECOMPILE.toLowerCase()) {
+        status.deposits = await xcmDeposits(net, receipt, confirmed);
+        return status;
+      }
 
       status.deposits = await Promise.all(depositsInLogs(net, receipt.hash, receipt.logs).map(async (d): Promise<DepositInfo> => {
         const settled: boolean = net.gateway ? await vending.externalSettledDeposits(d.depositId) : await vending.settledDeposits(d.depositId);
@@ -588,9 +704,20 @@ export function makeApiService(config: Config, networks: Networks, dex: XodeDex 
     /// Purchase history for an address, from the relayer's ledger (empty if the API can't see it).
     deposits(addressValue: string) {
       const address = parseAddress(addressValue, "address");
+      // Purchases over XCM never reach the relayer's ledger; the API keeps its own record of them.
+      const overXcm = xcm.history.forBeneficiary(address).map((r) => ({
+        sourceChain: "assethub",
+        sourceTxHash: r.sourceTxHash,
+        index: 0,
+        depositId: r.topic,
+        usdtAmount: usdtAmount(BigInt(r.usdtAmount)),
+        state: r.state as DepositState,
+        settleTxHash: null,
+        updatedAt: r.time,
+      }));
       return {
         address,
-        deposits: ledger.forBeneficiary(address).map((r) => ({
+        deposits: [...overXcm, ...ledger.forBeneficiary(address).map((r) => ({
           sourceChain: r.sourceChain,
           sourceTxHash: r.sourceTxHash,
           index: r.depositIndex ?? 0,
@@ -599,7 +726,7 @@ export function makeApiService(config: Config, networks: Networks, dex: XodeDex 
           state: LEDGER_STATES[r.status] ?? "settling",
           settleTxHash: r.settleTxHash ?? null,
           updatedAt: r.time,
-        })),
+        }))].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
       };
     },
   };

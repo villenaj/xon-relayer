@@ -183,10 +183,12 @@ async function main(): Promise<void> {
     env: {
       ...process.env,
       // Isolate the run: its own checkpoints and ledger, no HTTP port, and none of a developer .env's
-      // production settings (key file, alert webhook, chain IDs, payout caps).
+      // production settings (key file, alert webhook, payout caps).
       CHECKPOINT_DIR: checkpointDir, LEDGER_FILE: path.join(checkpointDir, "ledger.jsonl"), HTTP_PORT: "0",
       RELAYER_PRIVATE_KEY_FILE: "", CREDENTIALS_DIRECTORY: "", ALERT_WEBHOOK_URL: "",
-      XODE_CHAIN_ID: "", ASSETHUB_CHAIN_ID: "", ETHEREUM_CHAIN_ID: "", MAX_EXTERNAL_DEPOSIT_USDT: "", MAX_EXTERNAL_DAILY_USDT: "",
+      // The relayer insists on being told each chain's ID; here they're whatever the local nodes report.
+      XODE_CHAIN_ID: String((await xodeProvider.getNetwork()).chainId), ASSETHUB_CHAIN_ID: String((await assetHubProvider.getNetwork()).chainId),
+      ETHEREUM_CHAIN_ID: String((await anvilProvider.getNetwork()).chainId), MAX_EXTERNAL_DEPOSIT_USDT: "", MAX_EXTERNAL_DAILY_USDT: "",
       XODE_ETH_RPC, VENDING_ADDRESS: vendingAddress, RELAYER_PRIVATE_KEY: relayer.privateKey,
       POLL_INTERVAL_MS: "2000", CONFIRMATIONS: "0", ETHEREUM_CONFIRMATIONS: "0", ASSETHUB_CONFIRMATIONS: "0",
       ENABLE_XODE_ADAPTER: "true", ENABLE_ASSETHUB_ADAPTER: "true", ENABLE_ETHEREUM_ADAPTER: "true",
@@ -210,14 +212,14 @@ async function main(): Promise<void> {
 
     // 2. Ethereum (anvil) via UsdtGateway
     await (await mockUsdt.approve(ethGatewayAddress, 20_000_000n)).wait();
-    const ethReceipt = await (await ethGateway.deposit(20_000_000n, ethBeneficiary.address)).wait();
+    const ethReceipt = await (await ethGateway.deposit(20_000_000n, ethBeneficiary.address, 1n)).wait();
     console.log("Ethereum deposit sent (20 USDT), tx:", ethReceipt.hash);
 
     // 3. AssetHub via UsdtGateway
     const ahUsdt = new ethers.Contract(assetHubUsdtAddress, ["function approve(address,uint256) returns (bool)"], ahDepositor);
     await (await ahUsdt.approve(ahGatewayAddress, 15_000_000n)).wait();
     const ahGatewayAsDepositor = ahGateway.connect(ahDepositor) as ethers.Contract;
-    const ahReceipt = await (await ahGatewayAsDepositor.deposit(15_000_000n, assetHubBeneficiary.address)).wait();
+    const ahReceipt = await (await ahGatewayAsDepositor.deposit(15_000_000n, assetHubBeneficiary.address, 1n)).wait();
     console.log("AssetHub deposit sent (15 USDT), tx:", ahReceipt.hash);
 
     const nativeDepositId = nativeReceipt.hash;

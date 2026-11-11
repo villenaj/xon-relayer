@@ -117,13 +117,13 @@ runTool(async () => {
     let xonOut = 0n;
     for (const [depositId, p] of payouts) {
       xonOut += p.xonOut;
-      const rec = settledRecord(depositId);
+      // "already-settled": this instance saw the deposit itself but the payout was executed
+      // elsewhere - by another attester's instance, or by an attempt of its own it lost track of.
+      // Either way it's a deposit this instance read from the source chain, so the payout is
+      // checked against that just the same.
+      const rec = settledRecord(depositId) ?? (byDeposit.get(key(depositId)) ?? []).find((r) => r.status === "already-settled");
       if (!rec) {
-        if (has(depositId, "already-settled")) {
-          notes.push(`Payout ${p.txHash} (deposit ${depositId}) is only in the ledger as "already-settled" - an earlier attempt landed after being given up on.`);
-        } else {
-          issues.push(`UNRECORDED PAYOUT: ${p.kind} in tx ${p.txHash} (block ${p.block}) paid ${ethers.formatEther(p.xonOut)} XON to ${p.buyer} for deposit ${depositId}, which the ledger has no record of. Was it made by something other than this relayer?`);
-        }
+        issues.push(`UNRECORDED PAYOUT: ${p.kind} in tx ${p.txHash} (block ${p.block}) paid ${ethers.formatEther(p.xonOut)} XON to ${p.buyer} for deposit ${depositId}, which this instance never saw on its source chain. (A payout another attester executed is recorded once this instance has scanned its deposit - if it's recent, run this again once the adapters have caught up.)`);
       } else if (ethers.getAddress(rec.buyer) !== ethers.getAddress(p.buyer) || BigInt(rec.usdtAmount) !== p.usdtIn) {
         issues.push(`MISMATCH: deposit ${depositId} - ledger says ${usdt(BigInt(rec.usdtAmount))} to ${rec.buyer}, on-chain payout ${p.txHash} says ${usdt(p.usdtIn)} to ${p.buyer}.`);
       }
@@ -171,6 +171,7 @@ runTool(async () => {
       const deposits = (await collectLogs(xode, usdtAddress, TRANSFER_TOPIC, from, to)).filter((l) => key(l.topics[2]) === paddedVending);
       const accounted = makeAccountedTransfers(xode, usdtAddress, vendingAddress);
       const tracksCancels = await hasOptionalView(() => vending.nativeCancelled(ethers.ZeroHash));
+      let pendingUsdt = 0n; // deposits neither settled nor cancelled: in the balance, not yet accounted
       for (const { log, index } of withDepositIndex(deposits)) {
         const depositId = depositIdAt(log.transactionHash, index);
         // buy() / fundUsdtInventory(): the contract accounted for this USDT itself - not a deposit.
@@ -180,9 +181,30 @@ runTool(async () => {
           continue;
         }
         const settled: boolean = await vending.settledDeposits(depositId);
+        if (!settled) pendingUsdt += ethers.toBigInt(log.data);
         await checkDeposit("xode", depositId, log.transactionHash, index, ethers.toBigInt(log.data), settled);
       }
       console.log(`Deposits on xode (blocks ${from}-${to}): ${deposits.length}.`);
+
+      // USDT that reached the contract without an ERC-20 Transfer log - a Substrate
+      // `assets.transfer`, or an XCM deposit - is invisible to the relayer: never paid, never
+      // listed for a refund. It shows up only as balance nobody can explain: more than the
+      // contract has accounted for plus the deposits still waiting.
+      if (await hasOptionalView(() => vending.accountedUsdt())) {
+        const head = await xode.getBlockNumber();
+        // Deposits past the checkpoint, not looked at above, are waiting too.
+        const recent = to < head ? (await collectLogs(xode, usdtAddress, TRANSFER_TOPIC, to + 1, head)).filter((l) => key(l.topics[2]) === paddedVending) : [];
+        for (const { log, index } of withDepositIndex(recent)) {
+          if (await accounted.isAccounted(log.blockNumber, log.transactionHash, log.index)) continue;
+          if (!(await vending.settledDeposits(depositIdAt(log.transactionHash, index), { blockTag: head }))) pendingUsdt += ethers.toBigInt(log.data);
+        }
+        const token = new ethers.Contract(usdtAddress, ["function balanceOf(address) view returns (uint256)"], xode);
+        const [balance, accountedUsdt]: [bigint, bigint] = await Promise.all([token.balanceOf(vendingAddress, { blockTag: head }), vending.accountedUsdt({ blockTag: head })]);
+        const unexplained = balance - accountedUsdt - pendingUsdt;
+        if (unexplained > 0n) {
+          issues.push(`UNEXPLAINED USDT: the vending contract holds ${usdt(balance)} at block ${head}, but has accounted for ${usdt(accountedUsdt)} and ${usdt(pendingUsdt)} is in deposits waiting to be settled or cancelled since block ${from} - ${usdt(unexplained)} more than that. It arrived without an ERC-20 Transfer (a Substrate assets.transfer or an XCM deposit), or before block ${from}: nobody was paid for it and it isn't on the refund list. Find the sender in Xode's assets.Transferred / Issued events.`);
+        }
+      }
     }
   }
 

@@ -2,6 +2,7 @@
 // `npm run safe -- propose refund(s)`.
 
 import { ethers } from "ethers";
+import { collectRefundSignatures, FEE_BEARING_ERRORS } from "../adapters/attestedRefund.js";
 import { hasOptionalView, makeProvider } from "../chain.js";
 import { config } from "../config.js";
 import type { LedgerRecord } from "../ledger.js";
@@ -29,6 +30,10 @@ export interface RefundTarget {
   cancelCall?: { to: string; data: string };
   /// Gateway deposits: the gateway's deposit nonce, which its `Refunded` event names.
   depositNonce?: bigint;
+  /// Gateways with attested refunds, once the deposit is cancelled on Xode: how many attesters'
+  /// signatures are published there, how many the gateway needs, and - with enough - the
+  /// `refundAttested` call that anyone can send (no owner needed).
+  attested?: { signatures: number; threshold: number; call?: { to: string; data: string } };
   /// The gateway records deposits (has `refund`), whether or not this one is still recorded - a
   /// refunded deposit's record is cleared, so this can't be read off `refundCall`.
   recordsDeposits?: boolean;
@@ -40,7 +45,7 @@ const REFUNDED = new ethers.Interface([
 ]);
 
 /// Deposit errors that are the depositor's own doing, so a refund of them keeps the refund fee.
-export const FEE_BEARING_ERRORS = new Set(["MinimumNotMet"]);
+export { FEE_BEARING_ERRORS };
 const TRANSFER = ethers.id("Transfer(address,address,uint256)");
 
 /// Whether a refund tx's logs prove this deposit was refunded. On a gateway that records deposits,
@@ -139,7 +144,7 @@ export async function refundTarget(record: LedgerRecord): Promise<RefundTarget> 
   // Gateways with recorded deposits refund through `refund(nonce, depositor, amount)`, which can only
   // pay the original depositor; older ones need the owner's free-form withdraw.
   let refundCall: RefundTarget["refundCall"];
-  const chargeFee = FEE_BEARING_ERRORS.has(record.error ?? "");
+  let chargeFee = FEE_BEARING_ERRORS.has(record.error ?? "");
   // Only a gateway without `depositRecords` counts as an older one - an RPC error is an error.
   const recordsDeposits = await hasOptionalView(() => gateway.depositRecords(0n));
   if (recordsDeposits) {
@@ -154,8 +159,32 @@ export async function refundTarget(record: LedgerRecord): Promise<RefundTarget> 
     throw new Error(`The ledger's id for ${record.sourceTxHash} #${depositIndex} (${record.depositId}) isn't the one its deposit gives (${depositId}).`);
   }
   const { paid, cancelled, cancelCall } = await xodeStatus(depositId);
+
+  // Cancelled by the attesters: their vote fixed the fee, and their signatures (published on Xode)
+  // let anyone submit the refund.
+  let attested: RefundTarget["attested"];
+  const xodeProvider = makeProvider(config.xodeEthRpc, config.rpcTimeoutMs);
+  const vending = new ethers.Contract(config.vendingAddress, VENDING_ABI, xodeProvider);
+  const threshold = (await hasOptionalView(() => gateway.attestationThreshold())) ? Number(await gateway.attestationThreshold()) : 0;
+  if (cancelled && !paid && refundCall && threshold > 0 && (await hasOptionalView(() => vending.cancelChargesFee(ethers.ZeroHash)))) {
+    if (await vending.cancelChargesFee(depositId)) chargeFee = true;
+    const args = [event.args.depositNonce, payer, event.args.usdtAmount, chargeFee] as const;
+    refundCall = { to: gatewayAddress, data: gateway.interface.encodeFunctionData("refund", [...args]) };
+    const digest: string = await gateway.refundDigest(...args);
+    const logs: ethers.Log[] = [];
+    const topics = [vending.interface.getEvent("RefundSigned")!.topicHash, depositId];
+    const head = await xodeProvider.getBlockNumber();
+    for (let from = config.xodeStartBlock ?? 0; from <= head; from += config.logChunkSize) {
+      logs.push(...await xodeProvider.getLogs({ address: config.vendingAddress, topics, fromBlock: from, toBlock: Math.min(from + config.logChunkSize - 1, head) }));
+    }
+    const signatures = await collectRefundSignatures(logs, vending.interface, digest, (a) => gateway.isAttester(a));
+    attested = { signatures: signatures.length, threshold };
+    if (signatures.length >= threshold) {
+      attested.call = { to: gatewayAddress, data: gateway.interface.encodeFunctionData("refundAttested", [...args, signatures.slice(0, threshold).map((s) => s.signature)]) };
+    }
+  }
   return {
-    provider, payer, usdtAddress: await gateway.usdt(), heldBy: gatewayAddress, refundCall, chargeFee,
+    provider, payer, usdtAddress: await gateway.usdt(), heldBy: gatewayAddress, refundCall, chargeFee, attested,
     depositNonce: event.args.depositNonce, recordsDeposits, depositId, onXode: { paid, cancelled }, cancelCall,
   };
 }

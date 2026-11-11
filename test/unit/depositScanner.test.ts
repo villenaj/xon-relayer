@@ -101,18 +101,18 @@ test("a deposit someone else already settled mid-attempt is recorded and passed"
   assert.deepEqual(statuses(), ["a:already-settled", "b:settled"]);
 });
 
-test("a transient failure stalls at that deposit and retries it next poll, never skipping past it", async () => {
+test("a transient failure makes that deposit wait and retry next poll, without holding up the ones behind it", async () => {
   const { scanner, attempts, statuses, checkpoint } = await setup({
     logs: [{ blockNumber: 110, transactionHash: "a" }, { blockNumber: 120, transactionHash: "b" }, { blockNumber: 130, transactionHash: "c" }],
     outcomes: { b: [new Error("ECONNRESET")] },
   });
-  assert.equal(await scanner.tick(), 81, "blocks 120-200 still to go");
-  assert.deepEqual(attempts, ["a", "b"]);
-  assert.equal(checkpoint(), 120);
+  assert.equal(await scanner.tick(), 0, "the scan itself reached the head");
+  assert.deepEqual(attempts, ["a", "b", "c"], "c is paid although b, ahead of it, failed");
+  assert.equal(checkpoint(), 120, "a restart would find b again");
 
   assert.equal(await scanner.tick(), 0);
-  assert.deepEqual(attempts, ["a", "b", "b", "c"], "a is already settled, so it isn't sent again");
-  assert.deepEqual(statuses(), ["a:settled", "b:failed", "b:settled", "c:settled"]);
+  assert.deepEqual(attempts, ["a", "b", "c", "b"], "only b is sent again");
+  assert.deepEqual(statuses(), ["a:settled", "b:failed", "c:settled", "b:settled"]);
   assert.equal(checkpoint(), 201);
 });
 
@@ -147,9 +147,9 @@ test("the gate can skip, stall, and is told to release when a settle fails", asy
     gate: (d) => decisions[d.sourceTxHash] ?? { action: "settle", release: () => released++ },
   });
   await scanner.tick();
-  assert.deepEqual(attempts, ["a"]);
+  assert.deepEqual(attempts, ["a", "c"], "the capped deposit waits; the one after it is paid");
   assert.equal(released, 1);
-  assert.equal(checkpoint(), 120);
+  assert.equal(checkpoint(), 120, "the checkpoint stays at the deposit that's waiting");
 });
 
 test("on shutdown it stops before starting new work", async () => {
@@ -169,7 +169,7 @@ test("resumes from the checkpoint; with none and no start block, starts after th
   const fresh = await setup({ startBlock: null, head: 200, logs: [{ blockNumber: 150, transactionHash: "pre-existing" }] });
   await fresh.scanner.tick();
   assert.deepEqual(fresh.attempts, []);
-  assert.equal(fresh.checkpoint(), null, "nothing to scan yet");
+  assert.equal(fresh.checkpoint(), 201, "nothing to scan yet");
 });
 
 // Several deposits in one tx (a multisig or smart-wallet batch). Hashes are real 32-byte values
@@ -240,14 +240,14 @@ test("a deposit that keeps failing the same way gets one failed line per interva
   assert.deepEqual(statuses(), ["b:failed", "b:failed", "b:settled"]);
 });
 
-test("a deposit the verify RPCs don't confirm stalls the adapter; a disagreement also alerts, once", async () => {
+test("a deposit the verify RPCs don't confirm waits, unpaid; a disagreement also alerts, once", async () => {
   const verdicts: Record<string, { ok: true } | { ok: false; reason: string; mismatch: boolean }> = {
     lagging: { ok: false, reason: "verify RPC #1 hasn't seen block 110 reach finality yet", mismatch: false },
     forged: { ok: false, reason: "verify RPC #1 has a different deposit log at index 0", mismatch: true },
   };
   const lag = await setup({ logs: [{ blockNumber: 110, transactionHash: "lagging" }, { blockNumber: 120, transactionHash: "c" }], verify: async (d) => verdicts[d.sourceTxHash] ?? { ok: true } });
   await lag.scanner.tick();
-  assert.deepEqual(lag.attempts, []);
+  assert.deepEqual(lag.attempts, ["c"], "only the confirmed one is paid");
   assert.equal(lag.checkpoint(), 110);
   assert.deepEqual(lag.context.alertsSent, [], "an RPC that's just behind is waited on quietly");
 
@@ -260,5 +260,36 @@ test("a deposit the verify RPCs don't confirm stalls the adapter; a disagreement
 
   verdicts.lagging = { ok: true };
   await lag.scanner.tick();
-  assert.deepEqual(lag.attempts, ["lagging", "c"], "paid once the RPCs agree");
+  assert.deepEqual(lag.attempts, ["c", "lagging"], "paid once the RPCs agree");
+});
+
+test("a payout another attester executed is recorded once, and counted against the caps", async () => {
+  const dir = tmpDir();
+  const noted: string[] = [];
+  const run = async () => {
+    const s = await setup({ dir, logs: [{ blockNumber: 110, transactionHash: "theirs" }, { blockNumber: 120, transactionHash: "mine" }], alreadySettled: ["theirs"] });
+    return s;
+  };
+  const first = await run();
+  await first.scanner.tick();
+  assert.deepEqual(first.statuses(), ["mine:settled"], "without isPaidOut, an already-settled deposit is just passed over");
+
+  const context = fakeContext(tmpDir());
+  const settled = new Set(["theirs"]);
+  const source = {
+    label: "test", description: "test deposits",
+    provider: { getBlockNumber: async () => 200, getLogs: async () => [{ blockNumber: 110, transactionHash: "theirs" }] },
+    logAddress: "0x", topic: "0x", confirmations: 0, checkpointFile: "test.json", checkpointIdentity: "id", startBlock: 100, startBlockName: "TEST_START_BLOCK",
+    parse: (log: { transactionHash: string; blockNumber: number }) => ({ buyer: "0x01", usdtAmount: 5n, sourceChain: "test", sourceTxHash: log.transactionHash, sourceBlock: log.blockNumber }),
+    baseDepositId: (txHash: string) => txHash,
+    isSettled: async (d: { depositId: string }) => settled.has(d.depositId),
+    isPaidOut: async () => true,
+    onPaidElsewhere: (d: { sourceTxHash: string }) => noted.push(d.sourceTxHash),
+    settle: async () => { throw new Error("never"); },
+  } as unknown as DepositSource;
+  const scanner = await createDepositScanner(context, source);
+  await scanner.tick();
+  await scanner.tick();
+  assert.deepEqual(context.entries.map((e) => [e.sourceTxHash, e.status, e.error]), [["theirs", "already-settled", "SettledElsewhere"]]);
+  assert.deepEqual(noted, ["theirs"]);
 });

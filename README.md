@@ -10,7 +10,8 @@ Standalone relayer service that pays out XON on Xode for USDT received on any of
 - **AssetHub** - AssetHub now runs `pallet-revive` (enacted via governance, ~January 2026), so this
   leg works exactly like the Ethereum one: a `UsdtGateway` contract deployed on AssetHub itself,
   watched over AssetHub's own `pallet-revive-eth-rpc` bridge (a separate `eth-rpc` instance from
-  Xode's, pointed at AssetHub's node).
+  Xode's, pointed at AssetHub's node). Market-price purchases from AssetHub skip all of this: they go to Xode
+  over XCM in one call and are swapped on arrival - see "Market price from AssetHub over XCM".
 - **Ethereum** - the same contract (`EthUsdtGateway.sol` - the logic is chain-agnostic, it's pure
   USDT escrow, so it's reused unchanged for AssetHub too) pulls USDT via `transferFrom` and records
   the depositor's intended Xode beneficiary address in a `Deposited` event.
@@ -26,8 +27,14 @@ for those two paths - see the contract-level comments in `XonVendingMachine.sol`
 Both the Ethereum and AssetHub legs are really the same adapter (`src/adapters/evmGatewayAdapter.ts`)
 called with different chain config - `ethereumAdapter.ts` and `assetHubAdapter.ts` are thin wrappers
 around it. All three adapters run the same deposit loop (`src/adapters/depositScanner.ts`: resume
-from checkpoint, scan in chunks, settle in order, record outcomes); each adapter only says how to
+from checkpoint, scan in chunks, settle each deposit, record outcomes); each adapter only says how to
 read a deposit from its chain's logs and how to settle it.
+
+Each deposit is settled on its own. One that can't be paid yet - the reserve or USDT inventory is
+short, a daily limit has to refill, the fixed-rate paths are paused, the other attesters haven't
+voted, a verify RPC is behind - waits and is retried with a growing delay (up to 5 minutes), while
+the deposits after it are paid as usual. The checkpoint stays at the oldest deposit still waiting,
+so a restart finds it again. A deposit that has waited 30 minutes is alerted on once.
 
 ## Setup
 
@@ -108,9 +115,10 @@ bound how much it will pay out automatically:
   in the ledger with status `held` and not paid. Later deposits carry on. To pay it after checking
   it, run `npm run settle-held -- <source tx hash>` (plus `--index <n>` if the alert gives one); this re-reads the deposit from the source
   chain (it doesn't trust the ledger for the amount or recipient) and settles it, bypassing the caps.
-- `MAX_EXTERNAL_DAILY_USDT` - total across both chains in any rolling 24 hours. Once reached, the
-  AssetHub/Ethereum adapters pause at the next deposit and resume when older payouts age out. The
-  window is rebuilt from the ledger at startup, so restarting doesn't reset it. Releases made with
+- `MAX_EXTERNAL_DAILY_USDT` - total across both chains in any rolling 24 hours. Once reached,
+  AssetHub/Ethereum deposits wait and are paid as older payouts age out. The window counts every
+  payout this instance has seen - its own and the ones another attester's instance executed - and
+  is rebuilt from the ledger at startup, so restarting doesn't reset it. Releases made with
   `settle-held` count toward it from the next restart.
 
 The relayer logs a warning at startup if both are unset. These caps live in the relayer, so they
@@ -144,8 +152,8 @@ work side by side. Market-price payouts are bounded by the same external limits 
 
 - a vending contract with `settleExternalSwap` (it warns at startup if not), and USDT inventory in
   it - the owner adds it with `fundUsdtInventory`. Set `MIN_USDT_INVENTORY` to be alerted before it
-  runs out; meanwhile those deposits stall on `InsufficientUsdtInventory` and resume once it's
-  topped up. The USDT buyers pay accumulates in the gateways, so move it back periodically.
+  runs out; meanwhile those deposits wait on `InsufficientUsdtInventory` (others are still
+  paid) and go through once it's topped up. The USDT buyers pay accumulates in the gateways, so move it back periodically.
 - `XODE_SUBSTRATE_RPC` (Xode's ws/wss endpoint). When a swap fails, Xode's XCM precompile reverts
   with the same generic message whatever the reason, so the relayer asks the chain:
 
@@ -157,9 +165,54 @@ work side by side. Market-price payouts are bounded by the same external limits 
   | Anything else | Retries (`SwapFailed`) |
 
   Without `XODE_SUBSTRATE_RPC` every failed swap is retried, including one the pool can never
-  meet, which stalls the adapter behind it.
+  meet, which then waits (and is retried) indefinitely instead of going on the refund list.
 
 `settle-held` releases a held market-price deposit as a swap with its original minimum.
+
+### Market price from AssetHub over XCM
+
+By default (`ASSETHUB_MARKET_ROUTE=xcm`), market-price purchases from AssetHub don't use the gateway,
+the relayer or the USDT inventory at all. The front-end API hands the buyer's EVM wallet one call to
+AssetHub's XCM precompile (`0x…0A0000`, `execute`), which runs (see `src/xcmSwap.ts`):
+
+    SetFeesMode { jit_withdraw: true }          AssetHub's delivery fee (~0.031 DOT) from the buyer
+    TransferReserveAsset { USDT, Xode, [
+      BuyExecution { all the USDT }             Xode keeps 0.01 USDT + weight (XCM_SWAP_FEE)
+      SetAppendix [ DepositAsset → beneficiary ]
+      ExchangeAsset { USDT → at least the minimum XON }
+      SetTopic(id) ] }                          the message id on Xode, to find the outcome
+
+The USDT goes from the buyer straight to Xode's reserve account on AssetHub and is swapped on Xode's
+DEX in the same message, so there is nothing to attest, custody or pre-fund. If the swap can't meet
+the minimum (or swaps are paused, or the pool is pending), the appendix leaves the USDT - less Xode's
+fee - with the beneficiary on Xode instead; the API reports that as `refunded`. The XON (or USDT)
+goes to the AccountId32 pallet-revive credits for the beneficiary's address, exactly where an EVM
+transfer to that address would land.
+
+Before handing the call out, the API dry-runs the exact message on Xode (`DryRunApi`) and simulates
+the call on AssetHub (`eth_estimateGas`); a purchase that wouldn't go through is refused
+(`SwapUnavailable` / `SwapRejected`) instead of signed. Quotes offer the market price only while a
+probe purchase dry-runs cleanly - so nothing is offered before Xode runs a runtime with the XCM
+`AssetExchanger` (spec 17+). The API refuses purchases under 0.1 USDT and minimums under XON's
+existential deposit: below those, a failed swap's leftover can't be deposited and the executor
+drops it. The front-end decodes the call byte for byte before the wallet signs it.
+
+It needs `XODE_SUBSTRATE_RPC` on the API (for the account mapping, the dry run and the outcome),
+`XODE_PARA_ID` if Xode isn't 3417, and an open HRMP channel AssetHub → Xode. Completed purchases
+are recorded in `XCM_PURCHASES_FILE` (default `.checkpoints/xcm-purchases.jsonl`) for
+`/api/deposits`, since the relayer's ledger never sees them. Fixed-rate AssetHub purchases, and
+every Ethereum purchase, still go through the gateways. `ASSETHUB_MARKET_ROUTE=gateway` restores
+the old `depositForSwap` path for AssetHub; the relayer keeps settling `SwapDeposited` events either
+way, so deposits made before the switch are still paid. There is no automatic fallback: while Xode
+can't swap on arrival (before spec 17, say), the `xcm` route offers no market price from AssetHub at
+all, and the API warns about it at startup - set `ASSETHUB_MARKET_ROUTE=gateway` until the upgrade
+is live.
+
+A purchase's status is read from Xode by its message id (the topic), which is public, so anyone can
+send another message carrying it. Only a message whose USDT adds up to the purchase and that paid
+the beneficiary counts as "settled" or "refunded". A message that left the purchase's USDT in
+Xode's asset trap, or one whose assets can't be accounted for, is reported as "skipped" only after
+25 more Xode blocks show nothing better - until then the purchase stays "settling".
 
 ## Transaction ledger
 
@@ -176,9 +229,11 @@ JSON object per line:
 - `already-settled` - another attempt had already settled this deposit.
 - `skipped` - reverted with a permanent error (`error`, e.g. `ZeroAmount`, or `MinimumNotMet` for a
   market-price deposit the pool couldn't pay) and will never be retried.
-- `held` - over a payout cap, the relayer's or the contract's (`error` says which), over the
-  buyer's per-address daily limit, or during a fixed-rate pause. That covers Xode-native deposits too.
-  Waits for `npm run settle-held` (see Payout caps).
+- `held` - over a per-deposit payout cap, the relayer's or the contract's (`error` says which).
+  That covers Xode-native deposits too. Waits for `npm run settle-held` (see Payout caps).
+- `already-settled` - paid, but not by this attempt: `SettledDespiteError` (the settle reported an
+  error but landed), `SettledElsewhere` (another attester's instance executed the payout), or the
+  contract's own `AlreadySettled` / `AlreadyExternallySettled`.
 - `refunded` - a `skipped` deposit's USDT was returned to the payer (`refundTxHash` / `refundTo`).
 - `failed` - transient failure (`error` / `message`); retried next tick. A deposit that keeps failing
   the same way gets a fresh `failed` line at most every 10 minutes (the console logs every attempt,
@@ -218,7 +273,22 @@ before recording it: it must have succeeded on the deposit's chain and moved at 
 deposited amount of that chain's USDT to the payer. If it was refunded some other way, use
 `--force --note "how"`; the note is kept in the ledger.
 
-For an AssetHub/Ethereum deposit there are two steps, in this order, both from the owner Safes:
+For an AssetHub/Ethereum deposit the attesters handle this themselves, with no owner transaction on
+either chain (gateways and vending contracts that support it; `npm run setup` configures both):
+
+1. Each attester's relayer that gives up on a deposit **votes to cancel it on Xode**
+   (`attestExternalCancel`). `attestationThreshold` votes cancel it, and it can then never be paid.
+   The vote also fixes whether the refund keeps the gateway's `refundFee`: only when the deposit's
+   own minimum couldn't be met (`MinimumNotMet` at market price, `BelowMinimum` at the fixed rate).
+2. Once it is cancelled, and never before, each attester **signs the gateway's refund digest** for
+   that deposit and publishes the signature on Xode (`publishRefundSignature`).
+3. **Anyone** can then send the gateway's `refundAttested` with a quorum of those signatures.
+   `npm run refunds` prints the ready-made call (target and calldata) as soon as there are enough;
+   the relayer itself holds no gas on the source chains and sends nothing there.
+
+The gateway's own attester set and threshold (`addAttester`, `setAttestationThreshold`) decide
+whose signatures count; a threshold of 0 turns attested refunds off. If the attesters can't agree
+within an hour the relayer alerts, and the owner can still do it by hand, in this order:
 
 1. **Cancel it on Xode** (`npm run safe -- propose cancels --chain xode`). The vending contract
    then never pays it out, and the cancel itself fails if it was already paid. This is what stops a
@@ -242,6 +312,34 @@ withdrawn there. Again cancel first, then refund:
 `mark` refuses a refund whose deposit isn't cancelled on Xode yet (unless `--force`). Vending
 contracts deployed before `cancelNativeDeposit` can't cancel native deposits, and `npm run refunds`
 says so. Redeploy before refunding one.
+
+### What a gateway may withdraw
+
+A gateway counts every deposit as owed to its depositor (`owed`) until it is refunded or
+**released**, and `withdraw` refuses to touch owed USDT - so an unpaid deposit can always be
+refunded. Once deposits are paid on Xode, release them to make their USDT withdrawable:
+
+```bash
+npm run safe -- propose releases --chain ethereum   # then sign and execute as usual
+npm run safe -- propose withdraw 5000 --chain ethereum
+```
+
+`releases` only includes deposits that Xode shows as paid. A released deposit can't be refunded.
+
+### The buyer's minimum on fixed-rate deposits
+
+A gateway `deposit` carries the least XON its depositor accepts, like `depositForSwap` does. The
+payout is worked out when the deposit settles, minutes after it was made; if the fixed rate has
+dropped below the minimum by then, the settle reverts `BelowMinimum` and the deposit is refunded
+(less the refund fee) instead of paid less than the buyer was quoted. The API sets the minimum to
+its quote less `FIXED_RATE_TOLERANCE_BPS` (default 300 = 3%).
+
+### Registered deposit sources
+
+The vending contract only accepts votes and payouts for a source label (`ethereum`, `assethub`)
+its owner registered with `setSource(label, chainId, gateway)` - a queued change. Votes are bound
+to that registration, and each relayer refuses to start an adapter whose RPC chain ID or gateway
+address differs from it.
 
 ## Attesters, the change queue and other limits
 
@@ -277,10 +375,11 @@ says so. Redeploy before refunding one.
   reads too. The relayer warns if it comes from a plain env var.
 - **Fixed-rate pause.** Past `RATE_PAUSE_BPS` (default: `RATE_ALERT_BPS`), the rate keeper pauses
   `buy` and the fixed-rate deposit paths, and resumes them once the rate is back within half of
-  that. Market-price swaps keep working. Deposits that arrive during the pause are held, on every
-  chain including Xode. Once it lifts, pay them with `npm run settle-held`.
+  that. Market-price swaps keep working. Deposits that arrive during the pause wait, on
+  every chain including Xode, and are paid automatically once it lifts - nobody has to release them.
 - **Per-address limit.** `maxPerAddressPerDay` caps what one buyer or beneficiary can take per day
-  across every path, so a single party can't use up the shared allowance. A deposit over it is held.
+  across every path, so a single party can't use up the shared allowance. A deposit over it waits and is paid
+  automatically as the limit refills.
 - **Minimum deposit.** The gateways refuse deposits under `minDeposit`, and the API refuses to
   prepare them.
 
@@ -289,8 +388,14 @@ says so. Redeploy before refunding one.
 `npm run reconcile` cross-checks the ledger against the chains (read-only) and exits `1` if it
 finds a problem, so it can run from cron:
 
-- **Unrecorded payout** - a `Settled`/`ExternalSettled` event on Xode with no ledger record:
-  something other than this relayer paid out (another instance, or a leaked key).
+- **Unrecorded payout** - a `Settled`/`ExternalSettled` event on Xode for a deposit this instance
+  never saw on its source chain: a leaked key, or a payout for a deposit that doesn't exist. A payout
+  another attester's instance executed is not one of these - this instance records it
+  (`already-settled` / `SettledElsewhere`) when it scans the deposit, and checks its amount and
+  recipient against what it read itself.
+- **Unexplained USDT** - the vending contract holds more USDT than it has accounted for plus the
+  deposits still waiting: USDT that arrived without an ERC-20 `Transfer` (a Substrate
+  `assets.transfer` or an XCM deposit), which the relayer can't see and nobody was paid for.
 - **Ledger-only settlement** - the ledger says paid, but there's no payout event (e.g. a reorg).
 - **Mismatch** - the ledger, the payout and the deposit disagree on amount or recipient.
 - **Missed deposit** - a deposit behind its adapter's checkpoint that was never paid and isn't
@@ -330,6 +435,7 @@ once when something goes wrong and once when it recovers:
 
 - a balance drops below its threshold (and when it's back above it),
 - an adapter stalls past `STALL_ALERT_AFTER_MS` (and when it catches up),
+- a deposit has been waiting to be paid for 30 minutes,
 - a deposit is held for being over the per-deposit cap,
 - the 24h payout cap pauses an adapter.
 
@@ -357,9 +463,9 @@ are `{ "error": "<Code>", "message": "..." }` with a 4xx status, or 502 when a c
 | `GET /api/quote?amount=10&network=ethereum[&slippageBps=100]` | XON for that much USDT at the fixed rate, plus `warnings` if the payout would be delayed or held for review. On AssetHub/Ethereum, `swap` adds the market-price quote and the minimum that slippage would set (needs `XODE_SUBSTRATE_RPC`). |
 | `GET /api/balances/:address?networks=xode,ethereum` | Native and USDT balance on each network, and the gateway allowance where one is needed. |
 | `GET /api/allowance/:network/:address` | How much USDT the gateway may take from the address. |
-| `POST /api/tx/buy` | `{ network, from, amount, beneficiary?, minXonOut?, slippageBps? }` returns every transaction the purchase needs, in order: one USDT transfer on Xode, or approve (if needed) then deposit elsewhere. `beneficiary` (default `from`) is who gets the XON. On Xode it's always the sender. With `minXonOut` (an XON amount) or `slippageBps`, the deposit is a `depositForSwap`, paid at market price (`payout: "swap"`). |
+| `POST /api/tx/buy` | `{ network, from, amount, beneficiary?, minXonOut?, slippageBps? }` returns every transaction the purchase needs, in order: one USDT transfer on Xode, or approve (if needed) then deposit elsewhere. `beneficiary` (default `from`) is who gets the XON. On Xode it's always the sender. With `minXonOut` (an XON amount) or `slippageBps`, it's paid at market price (`payout: "swap"`): a `depositForSwap` on Ethereum, and on AssetHub (route `xcm`) a single `swap` step - the XCM precompile call, with `xcm` describing what it carries. |
 | `POST /api/tx/approve` | `{ network, from, amount }` returns only the approval (`amount: "max"` for unlimited). On Ethereum, a non-zero allowance is reset to 0 first, because USDT there requires it. |
-| `POST /api/tx/deposit` | `{ network, from, amount, beneficiary?, minXonOut?, slippageBps? }` returns only the gateway deposit (`depositForSwap` with a minimum, as for `buy`). It refuses if the allowance or balance is too low. |
+| `POST /api/tx/deposit` | `{ network, from, amount, beneficiary?, minXonOut?, slippageBps? }` returns only the gateway deposit (`depositForSwap` with a minimum, as for `buy`). It refuses if the allowance or balance is too low, and refuses market price on AssetHub's XCM route (`UseBuy`). |
 | `POST /api/tx/broadcast` | `{ network, signedTx }` sends a transaction the wallet signed but didn't send. It only accepts transactions to that network's USDT or gateway/vending contract. |
 | `GET /api/tx/:network/:hash` | The receipt, confirmation status and, for a purchase, each deposit's state and payout tx. |
 | `GET /api/tx/:network/:hash/events` | Event stream following the transaction until it's done (see below). |
@@ -540,10 +646,13 @@ Each runs in a one-off container with the relayer's settings, state directory an
    replace `/etc/xon-relayer/relayer-key` (step 3 of First deploy).
 4. Investigate the payout in the ledger and on-chain, then unpause and restart.
 
-**Adapter stalled (alert, or `/health` returns 503).** Check `docker compose logs relayer`.
+**Adapter stalled (alert, or `/health` returns 503).** Check `docker compose logs relayer`. The scan
+itself is behind - a deposit that can't be paid no longer stalls an adapter (see the next entry).
+- "Poll tick failed": the RPC is down or rate-limited.
+
+**Deposit waiting (alert after 30 minutes).** It's retried automatically; other deposits aren't affected.
 - Repeated "Failed to settle": the error name says why. `IsPaused` means the contract is paused;
   `InsufficientReserve` means it needs more XON; `NotRelayer` means the key and contract disagree.
-- "Poll tick failed": the RPC is down or rate-limited.
 - "24h payout cap reached": intended. It resumes by itself, or raise `MAX_EXTERNAL_DAILY_USDT`
   and restart.
 - Repeated `OverExternalDailyLimit`: the contract's daily allowance is used up. It refills over

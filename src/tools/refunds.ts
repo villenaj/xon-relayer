@@ -41,8 +41,13 @@ async function list(showAll: boolean): Promise<void> {
       const t = await refundTarget(r);
       if (t.onXode?.paid) {
         console.log(`          !! already PAID on Xode (${t.depositId}) - do NOT refund; mark it settled after checking.`);
+      } else if (t.attested?.call) {
+        console.log(`          cancelled on Xode and signed by ${t.attested.signatures} attester(s): ANYONE can refund ${usdt(BigInt(r.usdtAmount))}${t.chargeFee ? " less the refund fee (its minimum wasn't met)" : " in full"} to ${t.payer} on ${r.sourceChain} - no Safe needed. Send, from any funded account:`);
+        console.log(`            to:   ${t.attested.call.to}\n            data: ${t.attested.call.data}`);
       } else if (t.refundCall) {
+        if (t.attested) console.log(`          cancelled on Xode; ${t.attested.signatures} of ${t.attested.threshold} attester signatures published so far - once there are enough, anyone can submit the refund. Or, from the owner:`);
         if (!t.onXode?.cancelled) {
+          console.log(`          (the attesters cancel and sign refunds like this one by themselves - give them a few minutes. To do it from the owner instead:)`);
           console.log(`          1. cancel it on Xode first (ops Safe: npm run safe -- propose cancels --chain xode), or call`);
           console.log(`            to:   ${t.cancelCall!.to}\n            data: ${t.cancelCall!.data}`);
         }

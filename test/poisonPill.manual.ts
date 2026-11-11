@@ -122,7 +122,7 @@ async function main(): Promise<void> {
       // production settings (key file, alert webhook, chain IDs, payout caps).
       CHECKPOINT_DIR: checkpointDir, LEDGER_FILE: path.join(checkpointDir, "ledger.jsonl"), HTTP_PORT: "0",
       RELAYER_PRIVATE_KEY_FILE: "", CREDENTIALS_DIRECTORY: "", ALERT_WEBHOOK_URL: "",
-      XODE_CHAIN_ID: "", ASSETHUB_CHAIN_ID: "", ETHEREUM_CHAIN_ID: "", MAX_EXTERNAL_DEPOSIT_USDT: "", MAX_EXTERNAL_DAILY_USDT: "",
+      XODE_CHAIN_ID: String((await xodeProvider.getNetwork()).chainId), ASSETHUB_CHAIN_ID: "", ETHEREUM_CHAIN_ID: "", MAX_EXTERNAL_DEPOSIT_USDT: "", MAX_EXTERNAL_DAILY_USDT: "",
       XODE_ETH_RPC, VENDING_ADDRESS: vendingAddress, RELAYER_PRIVATE_KEY: relayer.privateKey,
       POLL_INTERVAL_MS: "2000", CONFIRMATIONS: "0", XODE_START_BLOCK: String(startBlock),
       ENABLE_XODE_ADAPTER: "true", ENABLE_ASSETHUB_ADAPTER: "false", ENABLE_ETHEREUM_ADAPTER: "false",

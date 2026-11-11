@@ -53,6 +53,11 @@ async function main(): Promise<void> {
   const dex = config.xodeSubstrateRpc ? await connectXodeDex(config.xodeSubstrateRpc) : null;
   if (!dex) console.warn("[api] XODE_SUBSTRATE_RPC not set - no market-price quotes; market-price purchases need an explicit minXonOut.");
   const service = makeApiService(config, networks, dex);
+  // The XCM route needs Xode's runtime to swap on arrival. Until it does, market price from
+  // AssetHub isn't offered at all - there's no silent fallback to the gateway - so say so loudly.
+  if ((await service.xcmRouteReady()) === false) {
+    console.warn("[api] ASSETHUB_MARKET_ROUTE=xcm, but Xode wouldn't swap a purchase arriving over XCM right now (its runtime doesn't have the XCM exchanger yet, swaps are paused, the pool is pending, or XODE_SUBSTRATE_RPC is missing). Market-price purchases from AssetHub stay hidden until it would. To keep offering them through the gateway meanwhile, set ASSETHUB_MARKET_ROUTE=gateway.");
+  }
   const streams = new StreamRegistry(config.apiMaxStreams);
   const scanners = makeScanners(networks, config.apiPollIntervalMs);
 

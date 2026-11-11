@@ -53,6 +53,13 @@ function fakeDex(state: { paused?: boolean; active?: boolean; quote?: bigint | n
     poolActive: async () => state.active ?? true,
     quoteUsdtToXon: async () => (state.quote === undefined ? 10n ** 18n : state.quote),
     spotXonPerUsdt: async () => 2n * 10n ** 17n,
+    // The XCM route's reads (xcmSwap.test.ts) - unused by the relayer.
+    accountOf: async () => { throw new Error("unused"); },
+    existentialDeposit: () => 10n ** 9n,
+    dryRunFromAssetHub: async () => { throw new Error("unused"); },
+    finalizedHead: async () => { throw new Error("unused"); },
+    blockAtOrBefore: async () => { throw new Error("unused"); },
+    findXcmSwapOutcome: async () => { throw new Error("unused"); },
     disconnect: async () => {},
   };
 }
@@ -63,17 +70,19 @@ test("both gateway events are read; only SwapDeposited carries the buyer's minim
   assert.notEqual(DEPOSITED_TOPIC, SWAP_DEPOSITED_TOPIC);
   assert.deepEqual(GATEWAY_DEPOSIT_TOPICS, [DEPOSITED_TOPIC, SWAP_DEPOSITED_TOPIC]);
 
-  const fixed = parseGatewayDeposit(gateway.interface, gatewayLog("Deposited", [DEPOSITOR, BENEFICIARY, 5_000_000n, 0n], "0xaa", 0), "ethereum");
+  const fixed = parseGatewayDeposit(gateway.interface, gatewayLog("Deposited", [DEPOSITOR, BENEFICIARY, 5_000_000n, 0n, 900n], "0xaa", 0), "ethereum");
   assert.equal(fixed?.usdtAmount, 5_000_000n);
   assert.equal(fixed?.minXonOut, undefined);
   assert.ok(!("minXonOut" in fixed!), "a fixed-rate deposit has no minXonOut key at all");
+  assert.equal(fixed?.fixedMinXonOut, 900n, "but it carries the least XON its depositor accepts at the fixed rate");
+  assert.equal(fixed?.depositor, ethers.getAddress(DEPOSITOR), "and who to refund");
 
   const swap = parseGatewayDeposit(gateway.interface, gatewayLog("SwapDeposited", [DEPOSITOR, BENEFICIARY, 2_000_000n, 1n, 3_800_000_000_000_000_000n], "0xbb", 0), "ethereum");
   assert.equal(swap?.buyer, ethers.getAddress(BENEFICIARY));
   assert.equal(swap?.usdtAmount, 2_000_000n);
   assert.equal(swap?.minXonOut, 3_800_000_000_000_000_000n);
 
-  const transfer = { ...gatewayLog("Deposited", [DEPOSITOR, BENEFICIARY, 1n, 0n], "0xcc", 0), topics: [ethers.id("Transfer(address,address,uint256)")] } as unknown as Log;
+  const transfer = { ...gatewayLog("Deposited", [DEPOSITOR, BENEFICIARY, 1n, 0n, 900n], "0xcc", 0), topics: [ethers.id("Transfer(address,address,uint256)")] } as unknown as Log;
   assert.equal(parseGatewayDeposit(gateway.interface, transfer, "ethereum"), null);
 });
 
@@ -139,19 +148,20 @@ test("a swap the pool can't meet is skipped (refund list) and the deposits behin
   assert.equal(context.entries[0].minXonOut, 10n ** 18n, "the ledger keeps the buyer's minimum");
 });
 
-test("a swap that fails for a passing reason (paused, pool pending) stalls and is retried", async () => {
+test("a swap that fails for a passing reason (paused, pool pending) waits and is retried", async () => {
   const { scanner, context } = await scannerWith(
     async () => ({ kind: "transient", name: "SwapsPaused", detail: "paused" }),
     { swap: xcmFailure() },
   );
-  assert.ok((await scanner.tick()) > 0, "still behind: stalled at the swap");
-  assert.deepEqual(context.entries.map((e) => [e.sourceTxHash, e.status, e.error]), [["swap", "failed", "SwapsPaused"]]);
+  await scanner.tick();
+  assert.deepEqual(context.entries.map((e) => [e.sourceTxHash, e.status, e.error]).slice(0, 1), [["swap", "failed", "SwapsPaused"]]);
+  assert.ok(!context.entries.some((e) => e.sourceTxHash === "swap" && e.status !== "failed"), "not given up on");
 });
 
 test("if the diagnosis itself fails, the deposit is retried, never given up on", async () => {
   const { scanner, context } = await scannerWith(async () => { throw new Error("Substrate RPC down"); }, { swap: xcmFailure() });
-  assert.ok((await scanner.tick()) > 0);
-  assert.deepEqual(context.entries.map((e) => e.status), ["failed"]);
+  await scanner.tick();
+  assert.deepEqual(context.entries.filter((e) => e.sourceTxHash === "swap").map((e) => e.status), ["failed"]);
 });
 
 test("permanent and held errors are never second-guessed by the diagnosis", async () => {
@@ -187,7 +197,7 @@ test("a market-price purchase deposits with depositForSwap and the buyer's minim
   assert.match(steps[1].description, /at least 3\.8 XON .* market price, or the USDT is refunded/);
 
   // Without a minimum it's the fixed-rate deposit, as before.
-  assert.equal(gateway.interface.parseTransaction({ data: depositStep(assetHub, DEPOSITOR, 2_000_000n, BENEFICIARY).tx.data })!.name, "deposit");
+  assert.equal(gateway.interface.parseTransaction({ data: depositStep(assetHub, DEPOSITOR, 2_000_000n, BENEFICIARY, undefined, 1n).tx.data })!.name, "deposit");
 });
 
 test("XON minimums and slippage are validated", () => {
@@ -201,7 +211,7 @@ test("XON minimums and slippage are validated", () => {
 test("the API numbers a tx's deposits across both events, like the relayer", () => {
   const TX = "0x" + "ab".repeat(32);
   const logs = [
-    gatewayLog("Deposited", [DEPOSITOR, BENEFICIARY, 1_000_000n, 0n], TX, 0),
+    gatewayLog("Deposited", [DEPOSITOR, BENEFICIARY, 1_000_000n, 0n, 900n], TX, 0),
     gatewayLog("SwapDeposited", [DEPOSITOR, BENEFICIARY, 2_000_000n, 1n, 1n], TX, 1),
   ];
   const found = depositsInLogs(assetHub, TX, logs);
@@ -328,7 +338,7 @@ test("a deposit refunded on the gateway is never paid out; older gateways withou
   await assert.rejects(gatewayRecordsDeposits(flaky as never), /timeout/);
   await assert.rejects(isRefundedOnGateway(flaky as never, 0n, true), /timeout/);
 
-  const parsed = parseGatewayDeposit(gateway.interface, gatewayLog("Deposited", [DEPOSITOR, BENEFICIARY, 5_000_000n, 7n], "0xaa", 0), "ethereum");
+  const parsed = parseGatewayDeposit(gateway.interface, gatewayLog("Deposited", [DEPOSITOR, BENEFICIARY, 5_000_000n, 7n, 900n], "0xaa", 0), "ethereum");
   assert.equal(parsed?.gatewayNonce, 7n, "the gateway's own nonce is carried on the deposit");
 });
 

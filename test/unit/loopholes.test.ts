@@ -12,8 +12,9 @@ const revert = (name: string) => ({ data: vending.interface.encodeErrorResult(na
 
 test("new contract errors are classified so one deposit can't stall the rest", () => {
   assert.equal(classifySettleError(vending, revert("DepositIsCancelled")).kind, "permanent", "cancelled for a refund: skipped, so it's listed for one");
-  assert.equal(classifySettleError(vending, revert("OverAddressDailyLimit")).kind, "held");
-  assert.equal(classifySettleError(vending, revert("FixedRatePaused")).kind, "held");
+  // Both pass on their own, so the deposit waits and is retried - nobody has to release it.
+  assert.equal(classifySettleError(vending, revert("OverAddressDailyLimit")).kind, "transient");
+  assert.equal(classifySettleError(vending, revert("FixedRatePaused")).kind, "transient");
   assert.equal(classifySettleError(vending, revert("AlreadyExternallySettled")).kind, "already-done", "another attester executed it");
   // Waiting for other attesters is retried like anything transient.
   assert.equal(classifySettleError(vending, new AwaitingQuorumError(ethers.ZeroHash, 1n, 2n)).kind, "transient");
