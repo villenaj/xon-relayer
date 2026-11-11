@@ -11,10 +11,11 @@
 // only thing connecting the two. See XonVendingMachine.sol's doc comment for the full trust story.
 
 import { ethers } from "ethers";
-import { makeProvider, verifyEndpoint, type Confirmations } from "../chain.js";
+import { hasOptionalView, makeProvider, verifyEndpoint, type Confirmations } from "../chain.js";
 import { USDT_DECIMALS } from "../config.js";
 import { externalDepositId } from "../settlement.js";
 import { diagnoseSwapFailure } from "../xodeDex.js";
+import { connectCrossChecker } from "./crossCheck.js";
 import { runDepositScanner, type Deposit, type Gate, type ParsedDeposit } from "./depositScanner.js";
 import type { AdapterContext } from "./types.js";
 import GATEWAY_ABI from "../abi/EthUsdtGateway.json" with { type: "json" };
@@ -35,14 +36,27 @@ export interface EvmGatewayAdapterOptions extends AdapterContext {
   /// Chain ID the RPC must report, if configured.
   expectedChainId: bigint | null;
   checkpointFile: string;
+  /// Independent RPCs for the same chain that must each confirm a deposit before it's paid.
+  verifyRpcUrls: string[];
 }
 
 export async function runEvmGatewayAdapter(options: EvmGatewayAdapterOptions): Promise<void> {
   const { settlement, ledger, limiter, alerts, dex, sourceChain, label, rpcUrl } = options;
   const provider = makeProvider(rpcUrl, options.config.rpcTimeoutMs);
-  await verifyEndpoint(provider, { label, expectedChainId: options.expectedChainId, contracts: { UsdtGateway: options.gatewayAddress } });
+  const chainId = await verifyEndpoint(provider, { label, expectedChainId: options.expectedChainId, contracts: { UsdtGateway: options.gatewayAddress } });
   const gateway = new ethers.Contract(options.gatewayAddress, GATEWAY_ABI, provider);
   const gatewayAddress = await gateway.getAddress();
+  // Decided once, here: a per-deposit "can't tell" must never read as "not refunded".
+  const recordsDeposits = await gatewayRecordsDeposits(gateway);
+  if (!recordsDeposits) console.warn(`[${label}] The gateway predates deposit records - deposits refunded on it can't be detected; cancel them on Xode before refunding.`);
+  const crossCheck = await connectCrossChecker(options.verifyRpcUrls, {
+    label, chainId, gatewayAddress, confirmations: options.confirmations, rpcTimeoutMs: options.config.rpcTimeoutMs,
+  });
+  if (crossCheck.count > 0) {
+    console.log(`[${label}] Each deposit is confirmed against ${crossCheck.count} more RPC(s) before it's paid.`);
+  } else {
+    console.warn(`[${label}] No ${sourceChain === "ethereum" ? "ETHEREUM" : "ASSETHUB"}_VERIFY_RPCS - payouts rest on this one RPC's word. Set independent ones (another provider, or your own node), and give every attester different ones.`);
+  }
 
   // Payout caps (see payoutLimits.ts): over the per-deposit cap is held for an operator; over the
   // 24h cap pauses this adapter until older payouts age out.
@@ -89,7 +103,7 @@ export async function runEvmGatewayAdapter(options: EvmGatewayAdapterOptions): P
     // record on the gateway, and nothing tells Xode. Treat it as done.
     isSettled: async (d) => {
       if (await settlement.isExternalSettled(d.depositId)) return true;
-      if (await isRefundedOnGateway(gateway, d.gatewayNonce)) {
+      if (await isRefundedOnGateway(gateway, d.gatewayNonce, recordsDeposits)) {
         console.warn(`[${label}] ${d.sourceTxHash}${d.depositIndex > 0 ? ` #${d.depositIndex}` : ""} was refunded on the gateway - never paying it out.`);
         return true;
       }
@@ -99,6 +113,7 @@ export async function runEvmGatewayAdapter(options: EvmGatewayAdapterOptions): P
       ? settlement.settleExternal(d.buyer, d.usdtAmount, sourceChain, d.depositId, label)
       : settlement.settleExternalSwap(d.buyer, d.usdtAmount, d.minXonOut, sourceChain, d.depositId, label),
     gate,
+    verify: crossCheck.count > 0 ? (_d, log) => crossCheck.check(log) : undefined,
     // A market-price swap that fails reverts with the XCM precompile's generic error - ask Xode's
     // DEX why, so a deposit the pool can no longer meet is refunded instead of retried forever.
     async diagnose(d, failure) {
@@ -128,16 +143,18 @@ export function parseGatewayDeposit(iface: ethers.Interface, log: ethers.Log, so
   };
 }
 
+/// Whether the gateway records deposits (has `depositRecords`) - older gateways don't. Asked once,
+/// at startup; an RPC error there fails startup rather than being read as "no".
+export function gatewayRecordsDeposits(gateway: { depositRecords(nonce: bigint): Promise<string> } | ethers.Contract): Promise<boolean> {
+  return hasOptionalView(() => (gateway as { depositRecords(nonce: bigint): Promise<string> }).depositRecords(0n));
+}
+
 /// Whether the gateway refunded deposit `nonce` - its record is cleared by `refund` (and set, never
-/// zero, by every deposit). Gateways from before deposits were recorded have no `depositRecords`:
-/// the call reverts, and nothing counts as refunded there.
-export async function isRefundedOnGateway(gateway: { depositRecords(nonce: bigint): Promise<string> } | ethers.Contract, nonce: bigint | undefined): Promise<boolean> {
-  if (nonce === undefined) return false;
-  try {
-    return (await (gateway as { depositRecords(nonce: bigint): Promise<string> }).depositRecords(nonce)) === ethers.ZeroHash;
-  } catch {
-    return false;
-  }
+/// zero, by every deposit). On a gateway without records (`recordsDeposits` false) nothing counts
+/// as refunded. Errors propagate: a failed lookup must stall the deposit, not let it be paid.
+export async function isRefundedOnGateway(gateway: { depositRecords(nonce: bigint): Promise<string> } | ethers.Contract, nonce: bigint | undefined, recordsDeposits: boolean): Promise<boolean> {
+  if (nonce === undefined || !recordsDeposits) return false;
+  return (await (gateway as { depositRecords(nonce: bigint): Promise<string> }).depositRecords(nonce)) === ethers.ZeroHash;
 }
 
 /// A failed swap whose revert doesn't say why: no decodable data, or a plain `Error(string)` - what

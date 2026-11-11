@@ -24,6 +24,10 @@ Environment=CHECKPOINT_DIR=/var/lib/xon-relayer
 # systemd >= 250 (Ubuntu 24.04, Debian 12) - on older systemd, see the README for the fallback.
 # Create it with:  systemd-creds encrypt --name=relayer-key - /etc/xon-relayer/relayer-key.cred
 LoadCredentialEncrypted=relayer-key:/etc/xon-relayer/relayer-key.cred
+# The rate keeper's key, the same way, if this instance runs the keeper. Never put it in
+# /etc/xon-relayer.env: the front-end API reads that file too.
+#   systemd-creds encrypt --name=rate-keeper-key - /etc/xon-relayer/rate-keeper-key.cred
+#LoadCredentialEncrypted=rate-keeper-key:/etc/xon-relayer/rate-keeper-key.cred
 
 Restart=always
 RestartSec=10

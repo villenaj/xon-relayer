@@ -3,11 +3,11 @@
 // contract's settled flags); the ledger only adds what the chain can't say - held/skipped/refunded,
 // and which Xode tx paid it.
 
-import { statSync } from "node:fs";
+import { closeSync, openSync, readSync, statSync } from "node:fs";
 import { ethers, type Log, type TransactionReceipt } from "ethers";
 import { getSafeHead } from "../chain.js";
 import { USDT_DECIMALS, type Config } from "../config.js";
-import { readLedger, type LedgerRecord, type LedgerStatus } from "../ledger.js";
+import { type LedgerRecord, type LedgerStatus } from "../ledger.js";
 import { depositIdAt, externalDepositId } from "../settlement.js";
 import { GATEWAY_DEPOSIT_TOPICS, TRANSFER_TOPIC } from "../tools/common.js";
 import type { XodeDex } from "../xodeDex.js";
@@ -99,32 +99,65 @@ export function depositsInLogs(network: Pick<Network, "name" | "usdtAddress" | "
   return found.map((d, index) => ({ ...d, index, depositId: depositIdAt(baseId, index) }));
 }
 
-/// The ledger, re-read only when the file changes. Missing (the API runs on another host than the
-/// relayer) just means no ledger detail.
-function makeLedgerView(file: string) {
-  let stamp = "";
+/// The ledger, read incrementally: only the bytes appended since the last look. The file is
+/// append-only (and can be large - it's never rotated by the relayer), so re-reading all of it
+/// whenever it changed blocked the event loop on every request while a deposit was being retried.
+/// It's read from the start again if it shrank or was replaced (logrotate). Missing (the API runs on
+/// another host than the relayer) just means no ledger detail.
+export function makeLedgerView(file: string) {
+  let identity = ""; // dev:ino - a replaced file starts over
+  let offset = 0;
+  let partial = ""; // a line not yet terminated (being written right now)
   let byDepositId = new Map<string, LedgerRecord>();
-  let all: LedgerRecord[] = [];
 
-  function refresh(): void {
-    let current = "";
-    try {
-      const stat = statSync(file);
-      current = `${stat.mtimeMs}:${stat.size}`;
-    } catch {
-      current = "missing";
-    }
-    if (current === stamp) return;
-    stamp = current;
-    all = current === "missing" ? [] : readLedger(file);
-    byDepositId = new Map();
+  function apply(record: LedgerRecord): void {
     // Later lines win: the last word on a deposit is its current state. A "failed" retry after
     // it was held doesn't un-hold it, so only let "failed" through when there's nothing else.
-    for (const record of all) {
-      const key = record.depositId.toLowerCase();
-      const previous = byDepositId.get(key);
-      if (record.status === "failed" && previous && previous.status !== "failed") continue;
-      byDepositId.set(key, record);
+    const key = record.depositId.toLowerCase();
+    const previous = byDepositId.get(key);
+    if (record.status === "failed" && previous && previous.status !== "failed") return;
+    byDepositId.set(key, record);
+  }
+
+  function refresh(): void {
+    let stat;
+    try {
+      stat = statSync(file);
+    } catch {
+      identity = "";
+      offset = 0;
+      partial = "";
+      byDepositId = new Map();
+      return;
+    }
+    const current = `${stat.dev}:${stat.ino}`;
+    if (current !== identity || stat.size < offset) {
+      identity = current;
+      offset = 0;
+      partial = "";
+      byDepositId = new Map();
+    }
+    if (stat.size === offset) return;
+
+    const fd = openSync(file, "r");
+    let text: string;
+    try {
+      const buffer = Buffer.alloc(stat.size - offset);
+      const read = readSync(fd, buffer, 0, buffer.length, offset);
+      offset += read;
+      text = partial + buffer.subarray(0, read).toString("utf8");
+    } finally {
+      closeSync(fd);
+    }
+    const lines = text.split("\n");
+    partial = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        apply(JSON.parse(line) as LedgerRecord);
+      } catch {
+        console.warn(`[api] Ignoring a malformed line in ${file}.`);
+      }
     }
   }
 

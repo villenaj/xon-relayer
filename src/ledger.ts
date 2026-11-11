@@ -26,6 +26,8 @@ export interface LedgerEntry {
   depositIndex?: number;
   depositId: string;
   sourceBlock: number;
+  /// The deposit log's index within its block (entries written since it was recorded).
+  sourceLogIndex?: number;
   /// Market-price deposits only: the buyer's minimum, in XON's 18-decimal units.
   minXonOut?: bigint;
   settleTxHash?: string;

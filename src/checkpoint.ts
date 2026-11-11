@@ -2,7 +2,7 @@
 // checkpoint file so a restart resumes each source independently from where it left off, instead
 // of silently skipping whatever arrived on that source during downtime.
 
-import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 
 export interface Checkpoint<T> {
@@ -33,9 +33,30 @@ export function makeCheckpoint<T>(filePath: string, identity: string): Checkpoin
     if (dir !== "." && !existsSync(dir)) mkdirSync(dir, { recursive: true });
     const tmpFile = `${filePath}.tmp`;
     const contents: CheckpointFile<T> = { identity, value };
-    writeFileSync(tmpFile, JSON.stringify(contents, null, 2));
+    // Write-fsync-rename-fsync(dir): without the fsyncs, a power cut can leave a renamed but empty
+    // checkpoint, which load() can't parse - and the relayer wouldn't start until it's fixed by hand.
+    const fd = openSync(tmpFile, "w");
+    try {
+      writeSync(fd, JSON.stringify(contents, null, 2));
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
     renameSync(tmpFile, filePath);
+    syncDir(dir);
   }
 
   return { load, save };
+}
+
+function syncDir(dir: string): void {
+  let fd: number | null = null;
+  try {
+    fd = openSync(dir, "r");
+    fsyncSync(fd);
+  } catch {
+    // Some platforms/filesystems can't fsync a directory - the file itself is already synced.
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
 }

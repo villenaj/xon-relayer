@@ -14,6 +14,9 @@ ExecStart=/usr/bin/node dist/api/index.js
 
 # Shares the relayer's settings. Set API_HOST / API_PORT / API_CORS_ORIGINS there.
 EnvironmentFile=/etc/xon-relayer.env
+# It runs as the relayer's user (to read the ledger), so hide the relayer's decrypted credentials
+# from it: same user would otherwise mean it could read the relayer key there. ("-": fine if absent.)
+InaccessiblePaths=-/run/credentials/xon-relayer.service
 Environment=CHECKPOINT_DIR=/var/lib/xon-relayer
 
 Restart=always

@@ -3,7 +3,7 @@
 // `settlePurchase` in XonVendingMachine.sol).
 
 import { ethers } from "ethers";
-import { isAccountedByVending } from "./accountedTransfers.js";
+import { makeAccountedTransfers } from "./accountedTransfers.js";
 import { runDepositScanner } from "./depositScanner.js";
 import type { AdapterContext } from "./types.js";
 
@@ -16,6 +16,7 @@ export async function runXodeAdapter(context: AdapterContext): Promise<void> {
   const vendingAddress = await vending.getAddress();
   const usdtAddress: string = await vending.usdt();
   const paddedVending = ethers.zeroPadValue(vendingAddress, 32).toLowerCase();
+  const accounted = makeAccountedTransfers(provider, usdtAddress, vendingAddress);
 
   await runDepositScanner(context, {
     label: LABEL,
@@ -45,7 +46,10 @@ export async function runXodeAdapter(context: AdapterContext): Promise<void> {
     baseDepositId: (txHash) => txHash,
     // USDT the contract pulled in and accounted for itself (buy(), fundUsdtInventory()) isn't a
     // deposit: there's nothing to pay, and settlePurchase would revert UnverifiedDeposit forever.
-    isSettled: async (d) => (await settlement.isNativeSettled(d.depositId)) || isAccountedByVending(provider, vendingAddress, d.sourceTxHash),
+    // Matched to this exact transfer, so a plain transfer batched with a buy() is still paid.
+    // isNativeSettled also covers a deposit the owner cancelled to refund it.
+    isSettled: async (d) => (await settlement.isNativeSettled(d.depositId))
+      || accounted.isAccounted(d.sourceBlock, d.sourceTxHash, d.sourceLogIndex),
     settle: (d) => settlement.settleNative(d.buyer, d.usdtAmount, d.depositId, LABEL),
   });
 }

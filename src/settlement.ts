@@ -3,7 +3,7 @@
 
 import { ethers } from "ethers";
 import type { JsonRpcProvider, NonceManager, TransactionReceipt, TransactionRequest, TransactionResponse, Wallet } from "ethers";
-import { makeProvider, verifyEndpoint } from "./chain.js";
+import { hasOptionalView, makeProvider, verifyEndpoint } from "./chain.js";
 import { describeError } from "./errorClassifier.js";
 import VENDING_ABI from "./abi/XonVendingMachine.json" with { type: "json" };
 
@@ -207,6 +207,9 @@ export async function createSettlementClient({
     }
     return sendAndConfirm(sender, label, execute);
   }
+  // Whether this deployment can cancel native deposits (cancelNativeDeposit) - older ones can't.
+  const tracksNativeCancels = await hasOptionalView(() => vending.nativeCancelled(ethers.ZeroHash));
+
   // The relayer key lives on a server and signs unattended; the owner key can withdraw the whole
   // XON reserve and USDT inventory, lift every limit and replace the relayer. One key for both
   // means stealing the relayer key takes everything, and the limits stop bounding the loss.
@@ -224,8 +227,10 @@ export async function createSettlementClient({
     relayerAddress: wallet.address,
 
     // Native path: USDT paid directly to the vending contract on Xode itself.
+    /// Paid - or cancelled by the owner to be refunded instead, which must never be paid either.
     async isNativeSettled(depositTxHash: string): Promise<boolean> {
-      return vending.settledDeposits(depositTxHash);
+      if (await vending.settledDeposits(depositTxHash)) return true;
+      return tracksNativeCancels && (await vending.nativeCancelled(depositTxHash)) as boolean;
     },
     async settleNative(buyer: string, usdtAmount: bigint, depositTxHash: string, label: string): Promise<TransactionReceipt> {
       console.log(`[${label}] New deposit: ${buyer} sent ${usdtAmount.toString()} USDT (tx ${depositTxHash}). Settling...`);

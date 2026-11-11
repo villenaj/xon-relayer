@@ -2,7 +2,7 @@
 // `npm run safe -- propose refund(s)`.
 
 import { ethers } from "ethers";
-import { makeProvider } from "../chain.js";
+import { hasOptionalView, makeProvider } from "../chain.js";
 import { config } from "../config.js";
 import type { LedgerRecord } from "../ledger.js";
 import { depositIdAt, externalDepositId } from "../settlement.js";
@@ -25,7 +25,7 @@ export interface RefundTarget {
   /// paid or cancelled there. A refund is only safe once it's cancelled (which can't happen once paid).
   depositId?: string;
   onXode?: { paid: boolean; cancelled: boolean };
-  /// The ops Safe's call on Xode that cancels it.
+  /// The ops Safe's call on Xode that cancels it (cancelExternalDeposit / cancelNativeDeposit).
   cancelCall?: { to: string; data: string };
   /// Gateway deposits: the gateway's deposit nonce, which its `Refunded` event names.
   depositNonce?: bigint;
@@ -106,8 +106,19 @@ export async function refundTarget(record: LedgerRecord): Promise<RefundTarget> 
   if (record.sourceChain === "xode") {
     const provider = makeProvider(config.xodeEthRpc, config.rpcTimeoutMs);
     const vending = new ethers.Contract(config.vendingAddress, VENDING_ABI, provider);
-    // For a Xode-native deposit the ledger's buyer *is* the USDT sender.
-    return { provider, payer: record.buyer, usdtAddress: await vending.usdt(), heldBy: await vending.getAddress() };
+    const vendingAddress = await vending.getAddress();
+    // For a Xode-native deposit the ledger's buyer *is* the USDT sender. Its USDT can only leave the
+    // vending contract to the treasury, which then refunds the payer - but first the deposit is
+    // cancelled (cancelNativeDeposit), so it can never also be paid and its USDT stops counting as
+    // unaccounted. Older vending contracts can't cancel: then onXode/cancelCall are left out.
+    const base = { provider, payer: record.buyer, usdtAddress: await vending.usdt(), heldBy: vendingAddress, depositId: record.depositId };
+    if (!(await hasOptionalView(() => vending.nativeCancelled(ethers.ZeroHash)))) return base;
+    const [paid, cancelled]: boolean[] = await Promise.all([vending.settledDeposits(record.depositId), vending.nativeCancelled(record.depositId)]);
+    return {
+      ...base,
+      onXode: { paid, cancelled },
+      cancelCall: { to: vendingAddress, data: vending.interface.encodeFunctionData("cancelNativeDeposit", [record.depositId, BigInt(record.usdtAmount)]) },
+    };
   }
 
   const chain = externalChain(config, record.sourceChain);
@@ -128,16 +139,14 @@ export async function refundTarget(record: LedgerRecord): Promise<RefundTarget> 
   // Gateways with recorded deposits refund through `refund(nonce, depositor, amount)`, which can only
   // pay the original depositor; older ones need the owner's free-form withdraw.
   let refundCall: RefundTarget["refundCall"];
-  let recordsDeposits = false;
   const chargeFee = FEE_BEARING_ERRORS.has(record.error ?? "");
-  try {
+  // Only a gateway without `depositRecords` counts as an older one - an RPC error is an error.
+  const recordsDeposits = await hasOptionalView(() => gateway.depositRecords(0n));
+  if (recordsDeposits) {
     const recorded: string = await gateway.depositRecords(event.args.depositNonce);
-    recordsDeposits = true;
     if (recorded !== ethers.ZeroHash) {
       refundCall = { to: gatewayAddress, data: gateway.interface.encodeFunctionData("refund", [event.args.depositNonce, payer, event.args.usdtAmount, chargeFee]) };
     }
-  } catch {
-    // An older gateway without deposit records.
   }
   // Recomputed from the deposit itself, and checked against what the relayer recorded.
   const depositId = depositIdAt(externalDepositId(record.sourceChain, record.sourceTxHash), depositIndex);

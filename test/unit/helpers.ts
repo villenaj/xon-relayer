@@ -34,6 +34,7 @@ export function fakeContext(checkpointDir: string): AdapterContext & { entries: 
     config: { checkpointDir, logChunkSize: 100, pollIntervalMs: 1 },
     ledger: { record: (e: LedgerEntry) => entries.push(e) },
     alerts: { send: (message: string) => alertsSent.push(message) },
+    telemetry: { settleAttempt: () => {} },
     shutdown: makeShutdown(),
     entries,
     alertsSent,

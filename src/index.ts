@@ -1,6 +1,6 @@
 import { ethers } from "ethers";
 import type { Server } from "node:http";
-import { config, loadRelayerKey, USDT_DECIMALS, validateConfig } from "./config.js";
+import { config, loadRateKeeperKey, loadRelayerKey, USDT_DECIMALS, validateConfig } from "./config.js";
 import { acquireInstanceLock } from "./instanceLock.js";
 import { createSettlementClient, type SettlementClient } from "./settlement.js";
 import { makeLedger, readLedger, type Ledger } from "./ledger.js";
@@ -21,6 +21,10 @@ async function main(): Promise<void> {
   const relayerKey = loadRelayerKey();
   if (relayerKey.source.startsWith("RELAYER_PRIVATE_KEY env")) {
     console.warn("Relayer key comes from a plain env var - fine for development, but use the systemd credential in production (see README).");
+  }
+  const rateKeeperKey = loadRateKeeperKey();
+  if (rateKeeperKey?.source.startsWith("RATE_KEEPER_PRIVATE_KEY env")) {
+    console.warn("Rate keeper key comes from a plain env var - the front-end API reads the same settings file. Use the systemd credential \"rate-keeper-key\" or RATE_KEEPER_PRIVATE_KEY_FILE in production.");
   }
 
   // SIGTERM (systemd stop) / SIGINT (Ctrl+C): stop taking on new deposits, let the one in flight
@@ -115,8 +119,8 @@ async function main(): Promise<void> {
   // Each adapter and the monitor loop until shutdown, handling anything retryable internally - so
   // a rejection here is truly unrecoverable, and brings the whole process down (Promise.all
   // rejects on the first one) rather than leaving it running half-working.
-  const keeperLoop = dex ? [runRateKeeper({ settlement, config, dex, telemetry, alerts, shutdown })] : [];
-  if (!dex && config.rateKeeperKey) console.warn("RATE_KEEPER_PRIVATE_KEY is set but XODE_SUBSTRATE_RPC isn't - the keeper needs the DEX price, so it won't run.");
+  const keeperLoop = dex ? [runRateKeeper({ settlement, config, dex, telemetry, alerts, shutdown, keeperKey: rateKeeperKey?.key ?? null })] : [];
+  if (!dex && rateKeeperKey) console.warn("RATE_KEEPER_PRIVATE_KEY is set but XODE_SUBSTRATE_RPC isn't - the keeper needs the DEX price, so it won't run.");
   await Promise.all([...adapters, runMonitor(context), ...keeperLoop]);
 
   server?.close();

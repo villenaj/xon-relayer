@@ -16,12 +16,12 @@
 import { ethers } from "ethers";
 import type { Log } from "ethers";
 import path from "node:path";
-import { makeProvider, scanLogs, verifyEndpoint } from "../chain.js";
+import { hasOptionalView, makeProvider, scanLogs, verifyEndpoint } from "../chain.js";
 import { makeCheckpoint } from "../checkpoint.js";
 import { config, USDT_DECIMALS } from "../config.js";
 import { readLedger, type LedgerRecord, type LedgerStatus } from "../ledger.js";
 import { depositIdAt, externalDepositId } from "../settlement.js";
-import { isAccountedByVending } from "../adapters/accountedTransfers.js";
+import { makeAccountedTransfers } from "../adapters/accountedTransfers.js";
 import { blockOption, externalChains, GATEWAY_DEPOSIT_TOPICS, runTool, TRANSFER_TOPIC } from "./common.js";
 import GATEWAY_ABI from "../abi/EthUsdtGateway.json" with { type: "json" };
 import VENDING_ABI from "../abi/XonVendingMachine.json" with { type: "json" };
@@ -169,10 +169,16 @@ runTool(async () => {
       const usdtAddress: string = await vending.usdt();
       const paddedVending = key(ethers.zeroPadValue(vendingAddress, 32));
       const deposits = (await collectLogs(xode, usdtAddress, TRANSFER_TOPIC, from, to)).filter((l) => key(l.topics[2]) === paddedVending);
+      const accounted = makeAccountedTransfers(xode, usdtAddress, vendingAddress);
+      const tracksCancels = await hasOptionalView(() => vending.nativeCancelled(ethers.ZeroHash));
       for (const { log, index } of withDepositIndex(deposits)) {
         const depositId = depositIdAt(log.transactionHash, index);
         // buy() / fundUsdtInventory(): the contract accounted for this USDT itself - not a deposit.
-        if (await isAccountedByVending(xode, vendingAddress, log.transactionHash)) continue;
+        if (await accounted.isAccounted(log.blockNumber, log.transactionHash, log.index)) continue;
+        if (tracksCancels && await vending.nativeCancelled(depositId)) {
+          if (!has(depositId, "refunded")) notes.push(`xode deposit ${describeDeposit(log.transactionHash, index)} (${usdt(ethers.toBigInt(log.data))}) is cancelled on Xode but not yet recorded as refunded - see npm run refunds.`);
+          continue;
+        }
         const settled: boolean = await vending.settledDeposits(depositId);
         await checkDeposit("xode", depositId, log.transactionHash, index, ethers.toBigInt(log.data), settled);
       }

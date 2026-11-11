@@ -7,13 +7,13 @@ import path from "node:path";
 import { readFileSync } from "node:fs";
 import { ethers, type JsonRpcProvider, type Log, type TransactionReceipt } from "ethers";
 import { createDepositScanner, type DepositSource } from "../../src/adapters/depositScanner.js";
-import { DEPOSITED_TOPIC, GATEWAY_DEPOSIT_TOPICS, isRefundedOnGateway, parseGatewayDeposit, SWAP_DEPOSITED_TOPIC } from "../../src/adapters/evmGatewayAdapter.js";
+import { DEPOSITED_TOPIC, GATEWAY_DEPOSIT_TOPICS, gatewayRecordsDeposits, isRefundedOnGateway, parseGatewayDeposit, SWAP_DEPOSITED_TOPIC } from "../../src/adapters/evmGatewayAdapter.js";
 import { classifySettleError } from "../../src/errorClassifier.js";
 import { makeLedger, readLedger } from "../../src/ledger.js";
 import { depositIdAt, externalDepositId } from "../../src/settlement.js";
 import { diagnoseSwapFailure, type XodeDex } from "../../src/xodeDex.js";
 import { deviationBps, nextRate } from "../../src/rateKeeper.js";
-import { isAccountedByVending } from "../../src/adapters/accountedTransfers.js";
+import { makeAccountedTransfers, matchAccountedTransfers } from "../../src/adapters/accountedTransfers.js";
 const { refundProven } = await import("../../src/tools/refundTargets.js");
 import { fakeContext, quiet, revertError, tmpDir, vending } from "./helpers.js";
 import GATEWAY_ABI from "../../src/abi/EthUsdtGateway.json" with { type: "json" };
@@ -248,20 +248,44 @@ test("a settle that errors but landed on-chain is recorded as already settled - 
 test("USDT the vending contract pulled in itself (buy, fundUsdtInventory) isn't treated as a deposit", async () => {
   const VENDING = "0x00000000000000000000000000000000000000bb";
   const iface = new ethers.Interface(["event Bought(address indexed buyer, uint256 usdtIn, uint256 xonOut)", "event UsdtInventoryFunded(address indexed from, uint256 amount)", "event Transfer(address indexed from, address indexed to, uint256 value)"]);
-  const logOf = (address: string, event: string, args: unknown[]) => ({ address, ...iface.encodeEventLog(event, args) });
-  const receipts: Record<string, { logs: { address: string; topics: string[] }[] }> = {
-    funding: { logs: [logOf(USDT, "Transfer", [DEPOSITOR, VENDING, 5n]), logOf(VENDING, "UsdtInventoryFunded", [DEPOSITOR, 5n])] },
-    buy: { logs: [logOf(USDT, "Transfer", [DEPOSITOR, VENDING, 5n]), logOf(VENDING, "Bought", [DEPOSITOR, 5n, 25n])] },
-    deposit: { logs: [logOf(USDT, "Transfer", [DEPOSITOR, VENDING, 5n])] },
+  let index = 0;
+  const logOf = (tx: string, address: string, event: string, args: unknown[]) => ({ address, transactionHash: tx, index: index++, ...iface.encodeEventLog(event, args) });
+  const OTHER = ethers.getAddress("0x00000000000000000000000000000000000000dd");
+  const logs = [
+    logOf("0xf0", USDT, "Transfer", [DEPOSITOR, VENDING, 5n]), logOf("0xf0", VENDING, "UsdtInventoryFunded", [DEPOSITOR, 5n]),
+    logOf("0xb0", USDT, "Transfer", [DEPOSITOR, VENDING, 5n]), logOf("0xb0", VENDING, "Bought", [DEPOSITOR, 5n, 25n]),
+    logOf("0xd0", USDT, "Transfer", [DEPOSITOR, VENDING, 5n]),
     // Same event, but from some other contract - doesn't count.
-    spoofed: { logs: [logOf(USDT, "Transfer", [DEPOSITOR, VENDING, 5n]), logOf(GATEWAY, "UsdtInventoryFunded", [DEPOSITOR, 5n])] },
+    logOf("0x5f", USDT, "Transfer", [DEPOSITOR, VENDING, 5n]), logOf("0x5f", GATEWAY, "UsdtInventoryFunded", [DEPOSITOR, 5n]),
+    // A batch: a plain 7 USDT transfer, then a buy() of 5 - only the buy's own transfer is accounted.
+    logOf("0xba", USDT, "Transfer", [DEPOSITOR, VENDING, 7n]), logOf("0xba", USDT, "Transfer", [DEPOSITOR, VENDING, 5n]), logOf("0xba", VENDING, "Bought", [DEPOSITOR, 5n, 25n]),
+    // A batch of two same-sized transfers and one buy(): the buy claims the later one, the first is a deposit.
+    logOf("0xbb", USDT, "Transfer", [DEPOSITOR, VENDING, 5n]), logOf("0xbb", USDT, "Transfer", [DEPOSITOR, VENDING, 5n]), logOf("0xbb", VENDING, "Bought", [DEPOSITOR, 5n, 25n]),
+    // Someone else's transfer batched with a buy() of the same amount isn't the buy's.
+    logOf("0xcc", USDT, "Transfer", [OTHER, VENDING, 5n]), logOf("0xcc", VENDING, "Bought", [DEPOSITOR, 5n, 25n]),
+  ];
+  const transfers = logs.filter((l) => l.address === USDT);
+  const accounted = logs.filter((l) => l.address !== USDT);
+  const claimed = matchAccountedTransfers(transfers, accounted, VENDING.toUpperCase().replace("0X", "0x"));
+  const accountedTransfers = transfers.filter((t) => claimed.has(`${t.transactionHash}:${t.index}`)).map((t) => `${t.transactionHash}#${t.index}`);
+  assert.deepEqual(accountedTransfers, ["0xf0#0", "0xb0#2", "0xba#8", "0xbb#11"]);
+
+  // Read through eth_getLogs, by block - no receipts (Xode's eth-rpc can lose those).
+  let calls = 0;
+  const provider = {
+    getLogs: async (filter: { address: string; fromBlock: number }) => {
+      calls++;
+      if (filter.fromBlock === 2) return []; // a block with no accounted events: one call, done
+      return logs.filter((l) => l.address.toLowerCase() === filter.address.toLowerCase());
+    },
   };
-  const provider = { getTransactionReceipt: async (hash: string) => receipts[hash] ?? null } as unknown as JsonRpcProvider;
-  assert.equal(await isAccountedByVending(provider, VENDING, "funding"), true);
-  assert.equal(await isAccountedByVending(provider, VENDING.toUpperCase().replace("0X", "0x"), "buy"), true);
-  assert.equal(await isAccountedByVending(provider, VENDING, "deposit"), false);
-  assert.equal(await isAccountedByVending(provider, VENDING, "spoofed"), false);
-  await assert.rejects(isAccountedByVending(provider, VENDING, "missing"), /No receipt/);
+  const lookup = makeAccountedTransfers(provider as never, USDT, VENDING);
+  assert.equal(await lookup.isAccounted(1, "0xba", 8), true);
+  assert.equal(await lookup.isAccounted(1, "0xba", 7), false, "the plain transfer batched with a buy() is a deposit");
+  assert.equal(await lookup.isAccounted(1, "0xd0", 4), false);
+  assert.equal(calls, 2, "a block is looked up once for all its deposits");
+  assert.equal(await lookup.isAccounted(2, "0xd0", 4), false);
+  assert.equal(calls, 3);
 });
 
 // --- rate keeper ------------------------------------------------------------------------------------
@@ -291,11 +315,18 @@ test("the rate keeper steps toward the DEX price, within the contract's step and
 test("a deposit refunded on the gateway is never paid out; older gateways without records are unaffected", async () => {
   const records: Record<string, string> = { "0": ethers.ZeroHash, "1": ethers.id("recorded") };
   const gatewayWithRecords = { depositRecords: async (n: bigint) => records[n.toString()] ?? ethers.ZeroHash };
-  assert.equal(await isRefundedOnGateway(gatewayWithRecords as never, 0n), true, "record cleared by refund()");
-  assert.equal(await isRefundedOnGateway(gatewayWithRecords as never, 1n), false, "still recorded");
-  assert.equal(await isRefundedOnGateway(gatewayWithRecords as never, undefined), false, "no nonce known");
-  const olderGateway = { depositRecords: async () => { throw new Error("execution reverted"); } };
-  assert.equal(await isRefundedOnGateway(olderGateway as never, 0n), false);
+  assert.equal(await gatewayRecordsDeposits(gatewayWithRecords as never), true);
+  assert.equal(await isRefundedOnGateway(gatewayWithRecords as never, 0n, true), true, "record cleared by refund()");
+  assert.equal(await isRefundedOnGateway(gatewayWithRecords as never, 1n, true), false, "still recorded");
+  assert.equal(await isRefundedOnGateway(gatewayWithRecords as never, undefined, true), false, "no nonce known");
+  // An older gateway: the call reverts (no such function) - found out once, at startup.
+  const olderGateway = { depositRecords: async () => { throw ethers.makeError("execution reverted", "CALL_EXCEPTION", { action: "call", data: "0x", reason: null, transaction: { to: null, data: "0x" }, invocation: null, revert: null }); } };
+  assert.equal(await gatewayRecordsDeposits(olderGateway as never), false);
+  assert.equal(await isRefundedOnGateway(olderGateway as never, 0n, false), false);
+  // A flaky RPC is NOT an older gateway: it must not read as "not refunded" (and then get paid).
+  const flaky = { depositRecords: async () => { throw ethers.makeError("request timeout", "TIMEOUT", { operation: "call", reason: "timeout" }); } };
+  await assert.rejects(gatewayRecordsDeposits(flaky as never), /timeout/);
+  await assert.rejects(isRefundedOnGateway(flaky as never, 0n, true), /timeout/);
 
   const parsed = parseGatewayDeposit(gateway.interface, gatewayLog("Deposited", [DEPOSITOR, BENEFICIARY, 5_000_000n, 7n], "0xaa", 0), "ethereum");
   assert.equal(parsed?.gatewayNonce, 7n, "the gateway's own nonce is carried on the deposit");

@@ -31,7 +31,8 @@ export interface PayoutLimiter {
 /// doesn't hand out a fresh day's allowance.
 export function makePayoutLimiter(limits: PayoutLimitsConfig, history: LedgerRecord[]): PayoutLimiter {
   let window: { at: number; amount: bigint }[] = history
-    .filter((r) => r.status === "settled" && r.sourceChain !== "xode")
+    // "SettledDespiteError": a settle that reported an error but did land - a payout like any other.
+    .filter((r) => (r.status === "settled" || (r.status === "already-settled" && r.error === "SettledDespiteError")) && r.sourceChain !== "xode")
     .map((r) => ({ at: Date.parse(r.time), amount: BigInt(r.usdtAmount) }))
     .filter((e) => Number.isFinite(e.at));
 

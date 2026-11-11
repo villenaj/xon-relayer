@@ -31,6 +31,11 @@ services:
     environment:
       <<: *env
       RELAYER_PRIVATE_KEY_FILE: /run/secrets/relayer-key
+      # Running the rate keeper? Give it a secret too (never RATE_KEEPER_PRIVATE_KEY in the env
+      # file - the api service reads that file as well): uncomment these two lines and the
+      # rate-keeper-key secret below.
+      # RATE_KEEPER_PRIVATE_KEY_FILE: /run/secrets/rate-keeper-key
+    # secrets: [relayer-key, rate-keeper-key]
     secrets: [relayer-key]
     volumes:
       - /var/lib/xon-relayer:/var/lib/xon-relayer
@@ -54,3 +59,5 @@ services:
 secrets:
   relayer-key:
     file: /etc/xon-relayer/relayer-key
+  # rate-keeper-key:
+  #   file: /etc/xon-relayer/rate-keeper-key

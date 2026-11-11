@@ -25,10 +25,11 @@ interface Setup {
   outcomes?: Record<string, ("ok" | Error)[]>;
   alreadySettled?: string[];
   gate?: DepositSource["gate"];
+  verify?: DepositSource["verify"];
   dir?: string;
 }
 
-async function setup({ logs, head = 200, startBlock = 100, outcomes = {}, alreadySettled = [], gate, dir = tmpDir() }: Setup) {
+async function setup({ logs, head = 200, startBlock = 100, outcomes = {}, alreadySettled = [], gate, verify, dir = tmpDir() }: Setup) {
   const context = fakeContext(dir);
   const settled = new Set(alreadySettled);
   const attempts: string[] = [];
@@ -63,6 +64,7 @@ async function setup({ logs, head = 200, startBlock = 100, outcomes = {}, alread
       return { hash: `settle-${d.sourceTxHash}`, blockNumber: 999 } as unknown as TransactionReceipt;
     },
     gate,
+    verify,
   };
   const scanner = await createDepositScanner(context, source);
   const checkpoint = () => makeCheckpoint<number>(path.join(dir, "test.json"), "id").load();
@@ -213,4 +215,50 @@ test("retrying a batch after a stall numbers its deposits the same way", async (
     ["failed", 1, depositIdAt(BATCH, 1)],
     ["settled", 1, depositIdAt(BATCH, 1)],
   ]);
+});
+
+test("a rescan after a stall doesn't hold, alert or record the deposits before it all over again", async () => {
+  // Same block: "big" is held, then "b" fails transiently - so the next poll rescans block 110.
+  const { scanner, context, attempts, statuses } = await setup({
+    logs: [{ blockNumber: 110, transactionHash: "big", index: 0 }, { blockNumber: 110, transactionHash: "b", index: 1 }],
+    outcomes: { big: [revertError("OverExternalDepositLimit"), revertError("OverExternalDepositLimit")], b: [new Error("ECONNRESET")] },
+  });
+  await scanner.tick();
+  await scanner.tick();
+  assert.deepEqual(attempts, ["big", "b", "b"], "the held deposit isn't tried again");
+  assert.deepEqual(statuses(), ["big:held", "b:failed", "b:settled"]);
+  assert.equal(context.alertsSent.length, 1, "alerted once, not once per poll");
+});
+
+test("a deposit that keeps failing the same way gets one failed line per interval, not one per poll", async () => {
+  const { scanner, statuses } = await setup({
+    logs: [{ blockNumber: 110, transactionHash: "b" }],
+    outcomes: { b: [new Error("ECONNRESET"), new Error("ECONNRESET"), new Error("ECONNRESET"), revertError("IsPaused")] },
+  });
+  for (let i = 0; i < 5; i++) await scanner.tick();
+  // Three identical failures in a row: one line. A different failure is worth a new one.
+  assert.deepEqual(statuses(), ["b:failed", "b:failed", "b:settled"]);
+});
+
+test("a deposit the verify RPCs don't confirm stalls the adapter; a disagreement also alerts, once", async () => {
+  const verdicts: Record<string, { ok: true } | { ok: false; reason: string; mismatch: boolean }> = {
+    lagging: { ok: false, reason: "verify RPC #1 hasn't seen block 110 reach finality yet", mismatch: false },
+    forged: { ok: false, reason: "verify RPC #1 has a different deposit log at index 0", mismatch: true },
+  };
+  const lag = await setup({ logs: [{ blockNumber: 110, transactionHash: "lagging" }, { blockNumber: 120, transactionHash: "c" }], verify: async (d) => verdicts[d.sourceTxHash] ?? { ok: true } });
+  await lag.scanner.tick();
+  assert.deepEqual(lag.attempts, []);
+  assert.equal(lag.checkpoint(), 110);
+  assert.deepEqual(lag.context.alertsSent, [], "an RPC that's just behind is waited on quietly");
+
+  const bad = await setup({ logs: [{ blockNumber: 110, transactionHash: "forged" }], verify: async (d) => verdicts[d.sourceTxHash] ?? { ok: true } });
+  await bad.scanner.tick();
+  await bad.scanner.tick();
+  assert.deepEqual(bad.attempts, [], "never paid");
+  assert.equal(bad.context.alertsSent.length, 1);
+  assert.match(bad.context.alertsSent[0], /NOT paying forged: verify RPC #1 has a different deposit log/);
+
+  verdicts.lagging = { ok: true };
+  await lag.scanner.tick();
+  assert.deepEqual(lag.attempts, ["lagging", "c"], "paid once the RPCs agree");
 });

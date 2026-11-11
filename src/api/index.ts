@@ -32,7 +32,19 @@ async function relayerHealth(): Promise<unknown> {
   }
 }
 
+/// The API shares the relayer's settings file, but must never hold a signing key: drop any that
+/// ended up in its environment (and say so - they belong in a credential or key file, not there).
+function dropSigningKeys(): void {
+  for (const name of ["RELAYER_PRIVATE_KEY", "RATE_KEEPER_PRIVATE_KEY"]) {
+    if (process.env[name]) {
+      console.warn(`[api] ${name} is set in this process's environment - ignoring it. Keys belong in a credential or a *_FILE, not the shared settings file the API also reads.`);
+    }
+    delete process.env[name];
+  }
+}
+
 async function main(): Promise<void> {
+  dropSigningKeys();
   validateConfig();
   const networks = await connectNetworks(config);
   for (const net of networks.byName.values()) console.log(`[api] ${net.name}: chain ${net.chainId}, USDT ${net.usdtAddress}, pays into ${net.payTo}`);

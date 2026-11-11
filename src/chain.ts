@@ -2,7 +2,7 @@
 // that an RPC is the chain and contract we think it is, how far back from the head counts as "safe
 // to settle", and walking a block range in chunks small enough for RPC providers to accept.
 
-import { FetchRequest, JsonRpcProvider, type Log } from "ethers";
+import { FetchRequest, isError, JsonRpcProvider, type Log } from "ethers";
 
 export const DEFAULT_RPC_TIMEOUT_MS = 30_000;
 
@@ -36,6 +36,20 @@ export async function verifyEndpoint(provider: JsonRpcProvider, { label, expecte
     }
   }
   return chainId;
+}
+
+/// Whether a deployed contract has an optional view (one older deployments lack), found by calling
+/// it once: true if it answers, false if the call reverts (no such function). Anything else - a
+/// timeout, a dead RPC - is rethrown rather than read as "missing": a check that silently turns off
+/// on a flaky RPC is worse than one that fails loudly. Call it at startup, then trust the answer.
+export async function hasOptionalView(call: () => Promise<unknown>): Promise<boolean> {
+  try {
+    await call();
+    return true;
+  } catch (err) {
+    if (isError(err, "CALL_EXCEPTION")) return false;
+    throw err;
+  }
 }
 
 /// How settled a source-chain block must be before deposits in it are paid out: a fixed number of

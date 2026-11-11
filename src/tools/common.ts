@@ -18,6 +18,8 @@ export interface ExternalChain {
   startBlock: number | null;
   checkpointFile: string;
   chainId: bigint | null;
+  /// Independent RPCs that must each confirm a deposit (see adapters/crossCheck.ts).
+  verifyRpcUrls: string[];
 }
 
 /// An external source chain's settings by ledger name ("assethub" / "ethereum"), or null if it

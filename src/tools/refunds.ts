@@ -48,6 +48,14 @@ async function list(showAll: boolean): Promise<void> {
         }
         console.log(`          ${t.onXode?.cancelled ? "" : "2. "}refund ${usdt(BigInt(r.usdtAmount))}${t.chargeFee ? " less the refund fee (its minimum wasn't met)" : " in full"} to ${t.payer} on ${r.sourceChain}: have the gateway owner (e.g. its Safe) call`);
         console.log(`            to:   ${t.refundCall.to}\n            data: ${t.refundCall.data}`);
+      } else if (r.sourceChain === "xode" && t.cancelCall) {
+        if (!t.onXode?.cancelled) {
+          console.log(`          1. cancel it on Xode (ops Safe: npm run safe -- propose cancels --chain xode), or call`);
+          console.log(`            to:   ${t.cancelCall.to}\n            data: ${t.cancelCall.data}`);
+        }
+        console.log(`          ${t.onXode?.cancelled ? "" : "2. "}move ${usdt(BigInt(r.usdtAmount))} to the treasury (withdrawUsdt, ops Safe), and refund ${t.payer} on xode from the treasury`);
+      } else if (r.sourceChain === "xode") {
+        console.log(`          !! this vending contract can't cancel native deposits (no cancelNativeDeposit) - a refund would leave it payable. Redeploy before refunding it.`);
       } else {
         console.log(`          refund ${usdt(BigInt(r.usdtAmount))} (token ${t.usdtAddress}) to ${t.payer} on ${r.sourceChain}, from ${t.heldBy} using its owner key`);
       }
@@ -102,6 +110,10 @@ async function mark(sourceTxHash: string | undefined, refundTxHash: string | und
     target = { payer: ethers.getAddress(to) };
   }
 
+  // A refunded deposit that isn't cancelled on Xode can still be paid there as well.
+  if (!force && "onXode" in target && target.onXode && !target.onXode.cancelled) {
+    throw new Error(`${record.sourceTxHash} isn't cancelled on Xode - cancel it first (npm run safe -- propose cancels --chain xode), so it can't also be paid.`);
+  }
   if (!force && target.provider) {
     // The refund must be a successful tx on the deposit's own chain that transfers at least the
     // deposit amount of the same USDT token back to the original payer.

@@ -15,5 +15,6 @@ export function runEthereumAdapter(context: AdapterContext): Promise<void> {
     confirmations: config.ethereum.confirmations,
     expectedChainId: config.ethereum.chainId,
     checkpointFile: config.ethereum.checkpointFile,
+    verifyRpcUrls: config.ethereum.verifyRpcUrls,
   });
 }

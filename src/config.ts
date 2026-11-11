@@ -55,55 +55,60 @@ function optionalChainId(name: string): bigint | null {
 
 const checkpointDir = process.env.CHECKPOINT_DIR ?? ".checkpoints";
 
-const KEY_CREDENTIAL = "relayer-key";
-
-/// The relayer's signing key, from the first of these that's set:
-///   1. the systemd credential "relayer-key" ($CREDENTIALS_DIRECTORY/relayer-key) - production,
+/// A signing key from the first of these that's set (exactly one may be):
+///   1. the systemd credential `credential` ($CREDENTIALS_DIRECTORY/<credential>) - production,
 ///      encrypted at rest via LoadCredentialEncrypted (see systemd/xon-relayer.service);
-///   2. RELAYER_PRIVATE_KEY_FILE - a file holding the key;
-///   3. RELAYER_PRIVATE_KEY - the key itself (development/tests only).
-/// Only things that sign call this (the relayer, settle-held); read-only tools never load the key.
-export function loadRelayerKey(): { key: string; source: string } {
+///   2. `<envVar>_FILE` - a file holding the key (e.g. a Docker secret);
+///   3. `<envVar>` - the key itself (development/tests only).
+/// The env var is deleted once read, so nothing this process spawns inherits it. Never echoed.
+function loadKey(what: string, credential: string, envVar: string): { key: string; source: string } | null {
   const credentialDir = process.env.CREDENTIALS_DIRECTORY;
-  const credentialFile = credentialDir ? path.join(credentialDir, KEY_CREDENTIAL) : null;
+  const credentialFile = credentialDir ? path.join(credentialDir, credential) : null;
   const candidates: { source: string; read: () => string }[] = [];
   if (credentialFile && existsSync(credentialFile)) {
-    candidates.push({ source: `systemd credential "${KEY_CREDENTIAL}"`, read: () => readFileSync(credentialFile, "utf8") });
+    candidates.push({ source: `systemd credential "${credential}"`, read: () => readFileSync(credentialFile, "utf8") });
   }
-  const keyFile = process.env.RELAYER_PRIVATE_KEY_FILE;
-  if (keyFile) candidates.push({ source: `RELAYER_PRIVATE_KEY_FILE (${keyFile})`, read: () => readFileSync(keyFile, "utf8") });
-  const envKey = process.env.RELAYER_PRIVATE_KEY;
-  if (envKey) candidates.push({ source: "RELAYER_PRIVATE_KEY env var", read: () => envKey });
+  const keyFile = process.env[`${envVar}_FILE`];
+  if (keyFile) candidates.push({ source: `${envVar}_FILE (${keyFile})`, read: () => readFileSync(keyFile, "utf8") });
+  const envKey = process.env[envVar];
+  if (envKey) candidates.push({ source: `${envVar} env var`, read: () => envKey });
+  delete process.env[envVar];
 
-  if (candidates.length === 0) {
-    throw new Error(`No relayer key: load it as the systemd credential "${KEY_CREDENTIAL}", or set RELAYER_PRIVATE_KEY_FILE (or RELAYER_PRIVATE_KEY for development).`);
-  }
+  if (candidates.length === 0) return null;
   if (candidates.length > 1) {
-    throw new Error(`Relayer key is set in more than one place (${candidates.map((c) => c.source).join(", ")}) - set exactly one.`);
+    throw new Error(`The ${what} is set in more than one place (${candidates.map((c) => c.source).join(", ")}) - set exactly one.`);
   }
   const [{ source, read }] = candidates;
-  // Keep the key out of anything this process spawns or dumps from here on.
-  delete process.env.RELAYER_PRIVATE_KEY;
-
   const raw = read().trim();
   // Never echo the value - only say what's wrong with it. Wallets often export keys without the
   // 0x prefix (MetaMask does), so accept that too.
   if (!/^(0x)?[0-9a-fA-F]{64}$/.test(raw)) {
-    throw new Error(`The relayer key from ${source} isn't a 32-byte hex private key (64 hex characters, optionally prefixed with 0x).`);
+    throw new Error(`The ${what} from ${source} isn't a 32-byte hex private key (64 hex characters, optionally prefixed with 0x).`);
   }
-  const key = raw.startsWith("0x") ? raw : `0x${raw}`;
-  return { key, source };
+  return { key: raw.startsWith("0x") ? raw : `0x${raw}`, source };
 }
 
-/// The rate keeper's key (see rateKeeper.ts), from RATE_KEEPER_PRIVATE_KEY_FILE or
-/// RATE_KEEPER_PRIVATE_KEY, or null for none. Never echoed.
-function rateKeeperKey(): string | null {
-  const file = process.env.RATE_KEEPER_PRIVATE_KEY_FILE;
-  const raw = (file ? readFileSync(file, "utf8") : process.env.RATE_KEEPER_PRIVATE_KEY ?? "").trim();
-  delete process.env.RATE_KEEPER_PRIVATE_KEY;
-  if (!raw) return null;
-  if (!/^(0x)?[0-9a-fA-F]{64}$/.test(raw)) throw new Error("The rate keeper key isn't a 32-byte hex private key.");
-  return raw.startsWith("0x") ? raw : `0x${raw}`;
+/// The relayer's signing key (credential "relayer-key", RELAYER_PRIVATE_KEY_FILE, or
+/// RELAYER_PRIVATE_KEY). Only things that sign call this (the relayer, settle-held); read-only
+/// tools and the front-end API never load the key.
+export function loadRelayerKey(): { key: string; source: string } {
+  const loaded = loadKey("relayer key", "relayer-key", "RELAYER_PRIVATE_KEY");
+  if (!loaded) {
+    throw new Error(`No relayer key: load it as the systemd credential "relayer-key", or set RELAYER_PRIVATE_KEY_FILE (or RELAYER_PRIVATE_KEY for development).`);
+  }
+  return loaded;
+}
+
+/// The rate keeper's key (see rateKeeper.ts) - credential "rate-keeper-key",
+/// RATE_KEEPER_PRIVATE_KEY_FILE or RATE_KEEPER_PRIVATE_KEY - or null for none. Loaded only by the
+/// relayer, never at import: the API and tools share the same settings and must not read it.
+export function loadRateKeeperKey(): { key: string; source: string } | null {
+  return loadKey("rate keeper key", "rate-keeper-key", "RATE_KEEPER_PRIVATE_KEY");
+}
+
+/// Comma-separated URLs, or none.
+function urlList(name: string): string[] {
+  return (process.env[name] ?? "").split(",").map((u) => u.trim()).filter(Boolean);
 }
 
 function bps(name: string, fallback: number): bigint {
@@ -137,11 +142,12 @@ export const config = {
   // Only used on a genuinely first run (no checkpoint file yet) - e.g. if you're bootstrapping
   // the xode adapter against a contract that might already have unsettled deposits sitting on it.
   xodeStartBlock: optionalNumber("XODE_START_BLOCK"),
-  // The Xode path is backed by the contract's own balance check, so a block count is enough here.
+  // Finalized by default: the payout is backed by the contract's own balance check, but the
+  // checkpoint never moves back - a deposit a reorg re-included below it would never be seen.
   // CONFIRMATIONS is the pre-per-chain name for this setting, still honoured.
   xodeConfirmations: process.env.XODE_CONFIRMATIONS !== undefined
-    ? confirmations("XODE_CONFIRMATIONS", 1)
-    : confirmations("CONFIRMATIONS", 1),
+    ? confirmations("XODE_CONFIRMATIONS", "finalized")
+    : confirmations("CONFIRMATIONS", "finalized"),
   xodeCheckpointFile: "xode.json",
 
   // Caps on AssetHub/Ethereum payouts, in USDT - see payoutLimits.ts. Unset means no cap.
@@ -168,8 +174,10 @@ export const config = {
   // Fixed-rate drift (see rateKeeper.ts; needs XODE_SUBSTRATE_RPC for the DEX price). Without a
   // keeper key it only alerts past RATE_ALERT_BPS; with one it also moves the rate toward the
   // market whenever it's more than RATE_DEADBAND_BPS off, within the contract's own bounds.
-  rateKeeperKey: rateKeeperKey(),
   rateKeeperIntervalMs: Number(process.env.RATE_KEEPER_INTERVAL_MS ?? 60_000),
+  // The keeper acts on the median of this many DEX price samples, one per check, from different
+  // blocks - so moving the pool for a block or two (a flash swap) can't steer the rate or pause it.
+  rateKeeperSamples: Number(process.env.RATE_KEEPER_SAMPLES ?? 5),
   rateDeadbandBps: bps("RATE_DEADBAND_BPS", 50),
   rateAlertBps: bps("RATE_ALERT_BPS", 300),
   // Past this, the keeper pauses the fixed-rate paths until the rate is back within half of it
@@ -213,6 +221,8 @@ export const config = {
     confirmations: confirmations("ASSETHUB_CONFIRMATIONS", "finalized"),
     chainId: optionalChainId("ASSETHUB_CHAIN_ID"),
     checkpointFile: "assethub.json",
+    // Independent RPCs that must each confirm a deposit before it's paid (see crossCheck.ts).
+    verifyRpcUrls: urlList("ASSETHUB_VERIFY_RPCS"),
     // Only for display by the front-end API - its eth-rpc bridge reports balances with 18 decimals.
     nativeSymbol: process.env.ASSETHUB_NATIVE_SYMBOL ?? "DOT",
   },
@@ -226,6 +236,7 @@ export const config = {
     confirmations: confirmations("ETHEREUM_CONFIRMATIONS", "finalized"),
     chainId: optionalChainId("ETHEREUM_CHAIN_ID"),
     checkpointFile: "ethereum.json",
+    verifyRpcUrls: urlList("ETHEREUM_VERIFY_RPCS"),
     nativeSymbol: process.env.ETHEREUM_NATIVE_SYMBOL ?? "ETH",
   },
 };
@@ -243,6 +254,7 @@ export function validateConfig(): void {
     API_MAX_STREAMS: config.apiMaxStreams,
     API_POLL_INTERVAL_MS: config.apiPollIntervalMs,
     RATE_KEEPER_INTERVAL_MS: config.rateKeeperIntervalMs,
+    RATE_KEEPER_SAMPLES: config.rateKeeperSamples,
   };
   for (const [name, value] of Object.entries(positiveIntegers)) {
     if (!Number.isInteger(value) || value < 1) {

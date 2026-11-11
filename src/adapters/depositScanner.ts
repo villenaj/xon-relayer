@@ -24,6 +24,8 @@ export interface Deposit {
   depositIndex: number;
   depositId: string;
   sourceBlock: number;
+  /// The deposit log's index within its block.
+  sourceLogIndex: number;
   /// Set for a market-price deposit (gateway `SwapDeposited`): the least XON (18-decimal units)
   /// the buyer accepts. Absent for a fixed-rate one.
   minXonOut?: bigint;
@@ -32,7 +34,11 @@ export interface Deposit {
 }
 
 /// A deposit as read from its log, before the scanner works out its position within the tx.
-export type ParsedDeposit = Omit<Deposit, "depositIndex" | "depositId">;
+export type ParsedDeposit = Omit<Deposit, "depositIndex" | "depositId" | "sourceLogIndex">;
+
+/// A second opinion on a deposit before paying it (see crossCheck.ts): go ahead, or wait - and if
+/// the sources disagree outright rather than one lagging, say so loudly.
+export type Verdict = { ok: true } | { ok: false; reason: string; mismatch: boolean };
 
 /// What to do with a deposit before trying to settle it.
 export type Gate =
@@ -61,6 +67,9 @@ export interface DepositSource {
   isSettled(deposit: Deposit): Promise<boolean>;
   settle(deposit: Deposit): Promise<TransactionReceipt>;
   gate?(deposit: Deposit): Gate;
+  /// Checked after isSettled and before gate (so a deposit that's waiting reserves no cap): not
+  /// ok stalls the adapter here, as a transient failure would.
+  verify?(deposit: Deposit, log: Log): Promise<Verdict>;
   /// A second look at a failed settle the revert data couldn't explain (a market-price swap fails
   /// with the XCM precompile's generic error, whatever the cause). Return null to keep the default.
   diagnose?(deposit: Deposit, failure: SettleErrorClassification): Promise<(SettleErrorClassification & { detail: string }) | null>;
@@ -72,8 +81,13 @@ export interface DepositScanner {
   tick(): Promise<number>;
 }
 
+/// A deposit that keeps failing the same way gets a fresh "failed" ledger line at most this often -
+/// the console still logs every attempt. One line per poll (every 5s) grew the ledger by ~17k lines a
+/// day per stuck deposit, and everything that reads the ledger reads all of it.
+export const FAILED_RECORD_INTERVAL_MS = 10 * 60_000;
+
 export async function createDepositScanner(context: AdapterContext, source: DepositSource): Promise<DepositScanner> {
-  const { settlement, config, ledger, alerts, shutdown } = context;
+  const { settlement, config, ledger, alerts, shutdown, telemetry } = context;
   const { label, provider } = source;
   const checkpoint = makeCheckpoint<number>(path.join(config.checkpointDir, source.checkpointFile), source.checkpointIdentity);
 
@@ -100,6 +114,22 @@ export async function createDepositScanner(context: AdapterContext, source: Depo
     console.warn(`[${label}] No checkpoint/start block - starting from current block (${fromBlock}). Pre-existing deposits will be missed.`);
   }
 
+  // Deposits this run has already held or skipped (and recorded and alerted on). A stall makes the
+  // next poll rescan its whole block, which would otherwise hold/alert/record them all over again.
+  const passedOver = new Set<string>();
+  const lastFailure = new Map<string, { name: string | null; at: number }>();
+  const mismatchAlerted = new Set<string>();
+  function recordFailure(entry: Parameters<typeof ledger.record>[0]): void {
+    const previous = lastFailure.get(entry.depositId);
+    const now = Date.now();
+    if (previous && previous.name === (entry.error ?? null) && now - previous.at < FAILED_RECORD_INTERVAL_MS) {
+      telemetry.settleAttempt(label, "failed"); // still counted, just not written again
+      return;
+    }
+    lastFailure.set(entry.depositId, { name: entry.error ?? null, at: now });
+    ledger.record(entry);
+  }
+
   // Settles each deposit in order; returns the block of the first one that needs retrying (or
   // that shutdown interrupted before), if any.
   async function settleLogs(logs: Log[]): Promise<number | null> {
@@ -113,23 +143,45 @@ export async function createDepositScanner(context: AdapterContext, source: Depo
       if (!parsed) continue;
       const depositIndex = depositsSeen.get(parsed.sourceTxHash) ?? 0;
       depositsSeen.set(parsed.sourceTxHash, depositIndex + 1);
-      const deposit: Deposit = { ...parsed, depositIndex, depositId: depositIdAt(source.baseDepositId(parsed.sourceTxHash), depositIndex) };
+      const deposit: Deposit = {
+        ...parsed, depositIndex, sourceLogIndex: log.index,
+        depositId: depositIdAt(source.baseDepositId(parsed.sourceTxHash), depositIndex),
+      };
       if (shutdown.requested) return log.blockNumber;
       const tx = deposit.sourceTxHash;
+      if (passedOver.has(deposit.depositId)) continue;
 
       if (await source.isSettled(deposit)) {
         console.log(`[${label}] Skipping ${tx} - already settled.`);
+        lastFailure.delete(deposit.depositId);
         continue;
       }
 
+      if (source.verify) {
+        const verdict = await source.verify(deposit, log);
+        if (!verdict.ok) {
+          if (verdict.mismatch && !mismatchAlerted.has(deposit.depositId)) {
+            mismatchAlerted.add(deposit.depositId);
+            alerts.send(`[${label}] NOT paying ${tx}${deposit.depositIndex > 0 ? ` #${deposit.depositIndex}` : ""}: ${verdict.reason}. The adapter waits here until the RPCs agree - check them.`);
+          } else {
+            console.warn(`[${label}] Waiting on ${tx}: ${verdict.reason}.`);
+          }
+          return log.blockNumber;
+        }
+      }
+
       const gate = source.gate?.(deposit) ?? { action: "settle" };
-      if (gate.action === "skip") continue;
+      if (gate.action === "skip") {
+        passedOver.add(deposit.depositId);
+        continue;
+      }
       if (gate.action === "stall") return log.blockNumber;
 
       const entry = { adapter: label, ...deposit };
       try {
         const receipt = await source.settle(deposit);
         ledger.record({ ...entry, status: "settled", settleTxHash: receipt.hash, settleBlock: receipt.blockNumber });
+        lastFailure.delete(deposit.depositId);
       } catch (err) {
         // A settle that errored may still have landed: the RPC can lose the receipt (Xode's
         // eth-rpc does for blocks it fails to decode, e.g. after a runtime upgrade until it's
@@ -159,6 +211,7 @@ export async function createDepositScanner(context: AdapterContext, source: Depo
             console.error(`[${label}] Couldn't diagnose the failed settle of ${tx}:`, describeError(diagnoseErr));
           }
         }
+        if (kind !== "transient") passedOver.add(deposit.depositId);
         if (kind === "already-done") {
           console.log(`[${label}] ${tx} was already settled by another attempt (${name}) - continuing.`);
           ledger.record({ ...entry, status: "already-settled", error: name });
@@ -181,7 +234,7 @@ export async function createDepositScanner(context: AdapterContext, source: Depo
           continue;
         }
         console.error(`[${label}] Failed to settle ${tx} (${name ?? "unknown"}), will retry next tick:`, describeError(err));
-        ledger.record({ ...entry, status: "failed", error: name, message: describeError(err) });
+        recordFailure({ ...entry, status: "failed", error: name, message: describeError(err) });
         return log.blockNumber;
       }
     }

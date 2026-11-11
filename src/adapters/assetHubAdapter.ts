@@ -20,5 +20,6 @@ export function runAssetHubAdapter(context: AdapterContext): Promise<void> {
     confirmations: config.assetHub.confirmations,
     expectedChainId: config.assetHub.chainId,
     checkpointFile: config.assetHub.checkpointFile,
+    verifyRpcUrls: config.assetHub.verifyRpcUrls,
   });
 }

@@ -1,10 +1,15 @@
-// Operator command: pays out an AssetHub/Ethereum deposit that was held for being over a
-// per-deposit cap - the relayer's own, or XonVendingMachine's on-chain limit (status "held" in the
-// ledger). A market-price deposit (SwapDeposited) is paid the same way the relayer would have:
-// swapped at the DEX's price, with the buyer's own minimum. Bypasses the relayer's caps - that's the point - though not the contract's, so it only
-// takes the ledger's word for *which chain* the deposit is on: the beneficiary and amount are
-// re-read from the deposit tx itself on the source chain, which must also be past that chain's
-// confirmation threshold.
+// Operator command: pays out a deposit the relayer held (status "held" in the ledger) instead of
+// paying it automatically:
+//   - AssetHub/Ethereum: over a per-deposit cap - the relayer's own, or XonVendingMachine's on-chain
+//     limit - or the fixed-rate paths were paused. A market-price deposit (SwapDeposited) is paid the
+//     way the relayer would have: swapped at the DEX's price, with the buyer's own minimum. Bypasses
+//     the relayer's caps - that's the point - though not the contract's.
+//   - Xode (a plain USDT transfer into the vending contract): over the per-purchase limit, the
+//     buyer's per-address daily limit, or the fixed-rate paths were paused. Paid with settlePurchase
+//     once whatever held it has cleared.
+// Either way it only takes the ledger's word for *which deposit*: the beneficiary and amount are
+// re-read from the chain, which must also be past that chain's confirmation threshold (and, for an
+// external deposit, confirmed by the verify RPCs if any are set).
 //
 // Usage: npm run settle-held -- <source tx hash> [--index <n>]
 // --index picks one deposit when the tx holds several held ones (the alert says which).
@@ -13,11 +18,14 @@ import { ethers } from "ethers";
 import { getSafeHead, makeProvider, verifyEndpoint } from "../chain.js";
 import { config, loadRelayerKey, USDT_DECIMALS } from "../config.js";
 import { classifySettleError, describeError } from "../errorClassifier.js";
-import { makeLedger, readLedger } from "../ledger.js";
+import { makeLedger, readLedger, type LedgerRecord } from "../ledger.js";
 import { createSettlementClient, depositIdAt, externalDepositId } from "../settlement.js";
-import { isRefundedOnGateway, parseGatewayDeposit } from "../adapters/evmGatewayAdapter.js";
-import { externalChain, GATEWAY_DEPOSIT_TOPICS, option, runTool } from "./common.js";
+import { makeAccountedTransfers } from "../adapters/accountedTransfers.js";
+import { connectCrossChecker } from "../adapters/crossCheck.js";
+import { gatewayRecordsDeposits, isRefundedOnGateway, parseGatewayDeposit } from "../adapters/evmGatewayAdapter.js";
+import { externalChain, GATEWAY_DEPOSIT_TOPICS, option, runTool, TRANSFER_TOPIC } from "./common.js";
 import GATEWAY_ABI from "../abi/EthUsdtGateway.json" with { type: "json" };
+import VENDING_ABI from "../abi/XonVendingMachine.json" with { type: "json" };
 
 const LABEL = "settle-held";
 const USAGE = "Usage: npm run settle-held -- <source tx hash> [--index <n>]";
@@ -43,14 +51,89 @@ async function main(): Promise<void> {
     throw new Error(`${sourceTxHash} has several held deposits (indexes ${indexes}) - pick one with --index <n>.`);
   }
   const [held] = heldById.values();
-  const depositIndex = held.depositIndex ?? 0;
+  await (held.sourceChain === "xode" ? releaseNative(held) : releaseExternal(held));
+}
 
+/// A held Xode-native deposit: the USDT transfer is re-read from Xode's logs (not the ledger, and
+/// not a receipt - Xode's eth-rpc can lose those) and paid with settlePurchase.
+async function releaseNative(held: LedgerRecord): Promise<void> {
+  const depositIndex = held.depositIndex ?? 0;
+  const provider = makeProvider(config.xodeEthRpc, config.rpcTimeoutMs);
+  await verifyEndpoint(provider, { label: "xode", expectedChainId: config.xodeChainId, contracts: { XonVendingMachine: config.vendingAddress } });
+  const vending = new ethers.Contract(config.vendingAddress, VENDING_ABI, provider);
+  const vendingAddress = await vending.getAddress();
+  const usdtAddress: string = await vending.usdt();
+
+  if (held.sourceBlock > await getSafeHead(provider, config.xodeConfirmations)) {
+    throw new Error(`${held.sourceTxHash} isn't past Xode's confirmation threshold yet - try again later.`);
+  }
+  // The ledger names the block; the chain has to agree that this tx's transfer is in it.
+  const paddedVending = ethers.zeroPadValue(vendingAddress, 32).toLowerCase();
+  const transfers = (await provider.getLogs({ address: usdtAddress, topics: [TRANSFER_TOPIC], fromBlock: held.sourceBlock, toBlock: held.sourceBlock }))
+    .filter((l) => l.transactionHash.toLowerCase() === held.sourceTxHash.toLowerCase() && l.topics[2]?.toLowerCase() === paddedVending)
+    .sort((a, b) => a.index - b.index);
+  const log = transfers[depositIndex];
+  if (!log) throw new Error(`Xode block ${held.sourceBlock} has no USDT transfer #${depositIndex} into the vending contract in ${held.sourceTxHash}.`);
+  const depositId = depositIdAt(log.transactionHash, depositIndex);
+  if (depositId.toLowerCase() !== held.depositId.toLowerCase()) {
+    throw new Error(`Deposit #${depositIndex} of ${held.sourceTxHash} works out to id ${depositId}, but the ledger held ${held.depositId} - not releasing.`);
+  }
+  if (await makeAccountedTransfers(provider, usdtAddress, vendingAddress).isAccounted(log.blockNumber, log.transactionHash, log.index)) {
+    throw new Error(`That transfer was pulled in by buy() / fundUsdtInventory() - it isn't a deposit to pay.`);
+  }
+  const buyer = ethers.getAddress(ethers.dataSlice(log.topics[1], 12));
+  const usdtAmount = ethers.toBigInt(log.data);
+  const usdt = `${ethers.formatUnits(usdtAmount, USDT_DECIMALS)} USDT`;
+  console.log(`Releasing Xode deposit ${log.transactionHash} #${depositIndex}: ${usdt} to ${buyer} at the fixed rate (deposit id ${depositId}).`);
+
+  const settlement = await createSettlementClient({
+    xodeEthRpc: config.xodeEthRpc,
+    vendingAddress: config.vendingAddress,
+    relayerPrivateKey: loadRelayerKey().key,
+    expectedChainId: config.xodeChainId,
+    rpcTimeoutMs: config.rpcTimeoutMs,
+    allowOwnerAsRelayer: config.allowOwnerAsRelayer,
+    roles: { native: true, external: false },
+  });
+  const ledger = makeLedger(config.ledgerFile);
+  const entry = {
+    adapter: LABEL, buyer, usdtAmount, sourceChain: "xode", sourceTxHash: log.transactionHash,
+    depositIndex, depositId, sourceBlock: log.blockNumber, sourceLogIndex: log.index,
+  };
+  if (await settlement.isNativeSettled(depositId)) {
+    console.log("Already settled (or cancelled for a refund) on-chain - nothing to do.");
+    ledger.record({ ...entry, status: "already-settled" });
+    return;
+  }
+
+  try {
+    const receipt = await settlement.settleNative(buyer, usdtAmount, depositId, LABEL);
+    ledger.record({ ...entry, status: "settled", settleTxHash: receipt.hash, settleBlock: receipt.blockNumber });
+  } catch (err) {
+    ledger.record({ ...entry, status: "failed", message: describeError(err) });
+    const why: Record<string, string> = {
+      OverNativePurchaseLimit: `${usdt} is over XonVendingMachine's per-purchase limit - raise it with setNativeLimits (owner key, a queued change) first, then run this again`,
+      OverNativeDailyLimit: `${usdt} is more than the native daily allowance has left right now - try again later`,
+      OverAddressDailyLimit: `${buyer} has used up its per-address daily limit - try again once it has refilled`,
+      FixedRatePaused: "the fixed-rate paths are paused - try again once they're resumed",
+      UnverifiedDeposit: "the vending contract's USDT balance doesn't cover this deposit on top of what's accounted for - check `npm run reconcile`",
+      DepositIsCancelled: "the owner cancelled this deposit to refund it - it must not be paid",
+    };
+    const { name } = classifySettleError(settlement.vending, err);
+    if (name && why[name]) throw new Error(why[name]);
+    throw err;
+  }
+}
+
+async function releaseExternal(held: LedgerRecord): Promise<void> {
+  const depositIndex = held.depositIndex ?? 0;
+  const sourceTxHash = held.sourceTxHash.toLowerCase();
   const chain = externalChain(config, held.sourceChain);
   if (!chain) throw new Error(`No RPC/gateway configured for source chain "${held.sourceChain}".`);
 
   // Re-derive the deposit from the source chain rather than trusting the ledger file.
   const provider = makeProvider(chain.rpcUrl, config.rpcTimeoutMs);
-  await verifyEndpoint(provider, { label: chain.name, expectedChainId: chain.chainId, contracts: { UsdtGateway: chain.gatewayAddress } });
+  const chainId = await verifyEndpoint(provider, { label: chain.name, expectedChainId: chain.chainId, contracts: { UsdtGateway: chain.gatewayAddress } });
   const gateway = new ethers.Contract(chain.gatewayAddress, GATEWAY_ABI, provider);
   const gatewayAddress = (await gateway.getAddress()).toLowerCase();
   const receipt = await provider.getTransactionReceipt(sourceTxHash);
@@ -62,6 +145,11 @@ async function main(): Promise<void> {
     .filter((log) => log.address.toLowerCase() === gatewayAddress && GATEWAY_DEPOSIT_TOPICS.includes(log.topics[0]))
     .sort((a, b) => a.index - b.index)[depositIndex];
   if (!depositLog) throw new Error(`${sourceTxHash} has no deposit event #${depositIndex} from the gateway at ${gatewayAddress}.`);
+  const crossCheck = await connectCrossChecker(chain.verifyRpcUrls, {
+    label: chain.name, chainId, gatewayAddress, confirmations: chain.confirmations, rpcTimeoutMs: config.rpcTimeoutMs,
+  });
+  const verdict = await crossCheck.check(depositLog);
+  if (!verdict.ok) throw new Error(`Not releasing: ${verdict.reason}.`);
   const deposit = parseGatewayDeposit(gateway.interface, depositLog, held.sourceChain)!;
 
   const { buyer, usdtAmount, minXonOut } = deposit;
@@ -80,15 +168,16 @@ async function main(): Promise<void> {
     expectedChainId: config.xodeChainId,
     rpcTimeoutMs: config.rpcTimeoutMs,
     allowOwnerAsRelayer: config.allowOwnerAsRelayer,
+    roles: { native: false, external: true },
   });
   const ledger = makeLedger(config.ledgerFile);
   const entry = {
     adapter: LABEL, buyer, usdtAmount, sourceChain: held.sourceChain,
-    sourceTxHash: receipt.hash, depositIndex, depositId, sourceBlock: receipt.blockNumber,
+    sourceTxHash: receipt.hash, depositIndex, depositId, sourceBlock: receipt.blockNumber, sourceLogIndex: depositLog.index,
     ...(minXonOut === undefined ? {} : { minXonOut }),
   };
 
-  if (await isRefundedOnGateway(gateway, deposit.gatewayNonce)) {
+  if (await isRefundedOnGateway(gateway, deposit.gatewayNonce, await gatewayRecordsDeposits(gateway))) {
     throw new Error(`Deposit #${depositIndex} of ${receipt.hash} was refunded on the gateway - it must not be paid out as well.`);
   }
   if (await settlement.isExternalSettled(depositId)) {
@@ -116,6 +205,9 @@ async function main(): Promise<void> {
     }
     if (name === "OverExternalDailyLimit") {
       throw new Error(`${usdt} is more than XonVendingMachine's daily allowance has left right now - try again later, or raise it with setExternalLimits (owner key).`);
+    }
+    if (name === "FixedRatePaused") {
+      throw new Error("The fixed-rate paths are paused - try again once they're resumed.");
     }
     throw err;
   }

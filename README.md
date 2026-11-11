@@ -85,7 +85,7 @@ a block count, or `safe` / `finalized`:
 
 | Variable | Default | Why |
 | --- | --- | --- |
-| `XODE_CONFIRMATIONS` (or legacy `CONFIRMATIONS`) | `1` | Backed by the contract's own balance check. |
+| `XODE_CONFIRMATIONS` (or legacy `CONFIRMATIONS`) | `finalized` | The payout is backed by the contract's own balance check, but the checkpoint never moves back: a deposit a reorg re-included in an earlier block would be missed. |
 | `ASSETHUB_CONFIRMATIONS` | `finalized` | Payout rests on the relayer's word - a reorged-away deposit would be a straight loss. |
 | `ETHEREUM_CONFIRMATIONS` | `finalized` | Same; Ethereum finality is ~13 minutes. |
 
@@ -176,11 +176,13 @@ JSON object per line:
 - `already-settled` - another attempt had already settled this deposit.
 - `skipped` - reverted with a permanent error (`error`, e.g. `ZeroAmount`, or `MinimumNotMet` for a
   market-price deposit the pool couldn't pay) and will never be retried.
-- `held` - over a payout cap, the relayer's or the contract's (`error` says which); waits for
-  `npm run settle-held` (see Payout caps).
+- `held` - over a payout cap, the relayer's or the contract's (`error` says which), over the
+  buyer's per-address daily limit, or during a fixed-rate pause. That covers Xode-native deposits too.
+  Waits for `npm run settle-held` (see Payout caps).
 - `refunded` - a `skipped` deposit's USDT was returned to the payer (`refundTxHash` / `refundTo`).
-- `failed` - transient failure (`error` / `message`); retried next tick, so a stuck deposit logs
-  one `failed` line per poll until it settles or is fixed.
+- `failed` - transient failure (`error` / `message`); retried next tick. A deposit that keeps failing
+  the same way gets a fresh `failed` line at most every 10 minutes (the console logs every attempt,
+  and the `xon_relayer_settle_attempts_total` metric counts them all).
 
 `sourceTxHash` is the original deposit tx on its own chain, and `depositIndex` says which of its
 deposits this is (0-based) - one tx can carry several, e.g. a batch from a multisig or smart
@@ -228,11 +230,28 @@ For an AssetHub/Ethereum deposit there are two steps, in this order, both from t
    A depositor can name a different refund address with the gateway's `setRefundAddress`, for
    example if USDT has frozen theirs.
 
+A Xode-native deposit is refunded from the treasury, since the vending contract's USDT can only be
+withdrawn there. Again cancel first, then refund:
+
+1. **Cancel it on Xode** (`npm run safe -- propose cancels --chain xode`, which covers Xode-native
+   deposits too: `cancelNativeDeposit`). It then can never be paid, and its USDT is counted as
+   accounted for. Without the cancel, withdrawing it would leave the contract still treating it
+   as an unpaid deposit, payable against USDT that has already left.
+2. **Withdraw it to the treasury** (`withdrawUsdt`), and refund the payer from there.
+
+`mark` refuses a refund whose deposit isn't cancelled on Xode yet (unless `--force`). Vending
+contracts deployed before `cancelNativeDeposit` can't cancel native deposits, and `npm run refunds`
+says so. Redeploy before refunding one.
+
 ## Attesters, the change queue and other limits
 
 - **Attesters.** A cross-chain payout needs `attestationThreshold` of the vending contract's
   attesters to vote for that exact deposit. Then any attester can execute it. Run one relayer
-  instance per attester key, ideally on different machines with different RPCs.
+  instance per attester key, ideally on different machines with different RPCs. Set
+  `ASSETHUB_VERIFY_RPCS` / `ETHEREUM_VERIFY_RPCS` too: then a deposit is paid only once each of those
+  RPCs independently shows the same deposit log, in the same block, past the confirmation policy.
+  If they disagree, the adapter waits and alerts; if one is down, payouts wait until it's back.
+  Attesters that all trust one provider are a single point of failure, however many there are.
   `ENABLE_XODE_ADAPTER=false` on all but the one holding the `relayer` key, which is the only key
   allowed to settle Xode-native deposits. With one vote in, the relayer logs "waiting for other
   attesters" and retries. Market-price swaps execute after a random wait of up to
@@ -244,10 +263,22 @@ For an AssetHub/Ethereum deposit there are two steps, in this order, both from t
   `npm run safe -- status` shows it `READY`. The guardian Safe can stop a queued change with
   `propose cancel-change <id>`. Changes that only make things safer (lowering limits, removing an
   attester, pausing) take effect immediately. Watch `status` for changes you didn't queue.
+- **Rate keeper.** With `XODE_SUBSTRATE_RPC` set, the relayer compares the fixed `rate` with the
+  DEX price every `RATE_KEEPER_INTERVAL_MS` (default 60s). It alerts past `RATE_ALERT_BPS`, and with
+  a keeper key it steps the rate toward the market past `RATE_DEADBAND_BPS`, within the contract's
+  own step and interval bounds. It acts on the **median of the last `RATE_KEEPER_SAMPLES`** (default
+  5) price readings, each from a different block. A single reading of the pool is something anyone
+  with capital can move for a block. Acting on one would let a trader steer the rate (or trigger the
+  pause) and then buy against it. With the median, the pool has to be held off-market for more than
+  half the window, against arbitrage. Nothing happens until the window is full (about 5 minutes
+  after start). The keeper's transactions are bumped or given up on like settles, never waited on
+  forever. Load the keeper key like the relayer key: the systemd credential `rate-keeper-key`, or
+  `RATE_KEEPER_PRIVATE_KEY_FILE`. Never put it in `/etc/xon-relayer.env`, which the front-end API
+  reads too. The relayer warns if it comes from a plain env var.
 - **Fixed-rate pause.** Past `RATE_PAUSE_BPS` (default: `RATE_ALERT_BPS`), the rate keeper pauses
   `buy` and the fixed-rate deposit paths, and resumes them once the rate is back within half of
-  that. Market-price swaps keep working. Deposits that arrive during the pause are held; once it
-  lifts, pay them with `npm run settle-held`.
+  that. Market-price swaps keep working. Deposits that arrive during the pause are held, on every
+  chain including Xode. Once it lifts, pay them with `npm run settle-held`.
 - **Per-address limit.** `maxPerAddressPerDay` caps what one buyer or beneficiary can take per day
   across every path, so a single party can't use up the shared allowance. A deposit over it is held.
 - **Minimum deposit.** The gateways refuse deposits under `minDeposit`, and the API refuses to

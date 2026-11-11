@@ -106,12 +106,15 @@ async function proposeCalls(action: string, args: string[], chain: ChainName, ta
     case "cancels": {
       if (target.kind !== "vending") throw new Error("Deposits are cancelled on Xode's vending contract (--chain xode).");
       const calls: Call[] = [];
-      for (const r of awaitingRefund(readLedger(config.ledgerFile)).filter((x) => x.sourceChain !== "xode")) {
+      // External deposits are cancelled before their gateway refunds them; Xode-native ones before
+      // their USDT is withdrawn to the treasury to refund them (cancelNativeDeposit).
+      for (const r of awaitingRefund(readLedger(config.ledgerFile))) {
         const label = `${r.sourceChain} ${r.sourceTxHash}${(r.depositIndex ?? 0) > 0 ? ` #${r.depositIndex}` : ""}`;
         try {
           const t = await refundTarget(r);
           if (t.onXode?.paid) { console.warn(`!! ${label} was already PAID on Xode - it must not be refunded.`); continue; }
           if (t.onXode?.cancelled) continue;
+          if (!t.cancelCall) { console.warn(`Leaving out ${label}: this vending contract can't cancel native deposits - redeploy first.`); continue; }
           calls.push({ to: t.cancelCall!.to, value: 0n, data: t.cancelCall!.data });
         } catch (err) {
           console.warn(`Leaving out ${label}: ${err instanceof Error ? err.message : err}`);
