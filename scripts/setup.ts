@@ -72,6 +72,7 @@ const NATIVE_MAX_PER_PURCHASE = usdt(env("NATIVE_MAX_PER_PURCHASE_USDT", "100"))
 const NATIVE_MAX_PER_DAY = usdt(env("NATIVE_MAX_PER_DAY_USDT", "1000"));
 // What one buyer / beneficiary can take per day across every path (0 = no per-address limit).
 const ADDRESS_MAX_PER_DAY = usdt(env("ADDRESS_MAX_PER_DAY_USDT", "0"));
+const USDT_INVENTORY = usdt(env("VENDING_USDT_INVENTORY", "1000"));
 const ATTESTERS = Number(env("ATTESTERS", "1"));
 const ATTESTATION_THRESHOLD = BigInt(env("ATTESTATION_THRESHOLD", String(Math.floor(ATTESTERS / 2) + 1)));
 // Gateways: smallest deposit, and the fee kept from a market-price refund whose own minimum failed.
@@ -327,6 +328,14 @@ async function main(): Promise<void> {
   if ((await vending.contract.attestationThreshold()) !== ATTESTATION_THRESHOLD) {
     await (await vending.contract.setAttestationThreshold(ATTESTATION_THRESHOLD)).wait();
     console.log(`[xode] cross-chain payouts need ${ATTESTATION_THRESHOLD} of ${ATTESTERS} attesters`);
+  }
+  // USDT inventory for market-price payouts (settleExternalSwap swaps it for XON on the DEX).
+  const inventory: bigint = await vending.contract.accountedUsdt();
+  if (inventory < USDT_INVENTORY) {
+    const usdtToken = new ethers.Contract(xodeUsdt, ["function approve(address,uint256) returns (bool)"], xodeOwner);
+    await (await usdtToken.approve(vending.address, USDT_INVENTORY - inventory)).wait();
+    await (await vending.contract.fundUsdtInventory(USDT_INVENTORY - inventory)).wait();
+    console.log(`[xode] USDT inventory for market-price payouts topped up to ${ethers.formatUnits(USDT_INVENTORY, 6)}`);
   }
   if ((await vending.contract.maxPerAddressPerDay()) !== ADDRESS_MAX_PER_DAY) {
     await (await vending.contract.setAddressLimit(ADDRESS_MAX_PER_DAY)).wait();

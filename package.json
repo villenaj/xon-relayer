@@ -19,6 +19,7 @@
     "refunds": "node dist/tools/refunds.js",
     "reconcile": "node dist/tools/reconcile.js",
     "setup": "tsx scripts/setup.ts",
+    "bootstrap": "tsx scripts/bootstrapLocal.ts",
     "test:e2e": "tsx test/e2e.manual.ts",
     "test:multi-buyer": "tsx test/multiBuyer.manual.ts",
     "test:poison-pill": "tsx test/poisonPill.manual.ts",

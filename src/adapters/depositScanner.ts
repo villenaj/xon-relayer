@@ -238,8 +238,10 @@ export async function createDepositScanner(context: AdapterContext, source: Depo
       // would go on the refund list and be paid twice. Keep its cap reservation: it was paid.
       if (await source.isSettled(deposit).catch(() => false)) {
         console.warn(`[${label}] Settling ${tx} reported an error, but it's settled on-chain - recording it as already settled:`, describeError(err));
-        // Waiting for quorum and then finding it paid: another attester's instance executed it.
-        ledger.record({ ...entry, status: "already-settled", error: err instanceof AwaitingQuorumError ? "SettledElsewhere" : "SettledDespiteError", message: describeError(err) });
+        // Waiting for quorum and then finding it paid, or losing the race to execute it: another
+        // attester's instance paid it. Anything else: our own settle landed and its receipt was lost.
+        const elsewhere = err instanceof AwaitingQuorumError || classifySettleError(settlement.vending, err).kind === "already-done";
+        ledger.record({ ...entry, status: "already-settled", error: elsewhere ? "SettledElsewhere" : "SettledDespiteError", message: describeError(err) });
         recorded.add(deposit.depositId.toLowerCase());
         return true;
       }
