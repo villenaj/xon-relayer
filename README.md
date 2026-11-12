@@ -437,7 +437,13 @@ once when something goes wrong and once when it recovers:
 - an adapter stalls past `STALL_ALERT_AFTER_MS` (and when it catches up),
 - a deposit has been waiting to be paid for 30 minutes,
 - a deposit is held for being over the per-deposit cap,
-- the 24h payout cap pauses an adapter.
+- the 24h payout cap pauses an adapter,
+- USDT reaches the vending contract without an ERC-20 Transfer - a Substrate `assets.transfer` or
+  an XCM deposit. The relayer can't see such a payment, so it is neither paid out nor listed for
+  a refund; the alert gives the amount, and the sender has to be found on a block explorer and
+  refunded by the owner. It fires once the excess has been there for two checks, again if it
+  grows, and when it clears. Whatever was already unexplained when the relayer started is taken
+  as the baseline (it includes held and skipped deposits), so only `npm run reconcile` reports that.
 
 Alerts are always logged; set `ALERT_WEBHOOK_URL` to also POST them to a chat webhook. The body
 carries the message as both `text` (Slack, Mattermost, Google Chat) and `content` (Discord).
